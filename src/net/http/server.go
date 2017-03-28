@@ -948,7 +948,8 @@ func (c *conn) readRequest(ctx context.Context) (w *response, err error) {
 
 	hosts, haveHost := req.Header["Host"]
 	isH2Upgrade := req.isH2Upgrade()
-	if req.ProtoAtLeast(1, 1) && (!haveHost || len(hosts) == 0) && !isH2Upgrade {
+	//if req.ProtoAtLeast(1, 1) && (!haveHost || len(hosts) == 0) && !isH2Upgrade {
+	if req.ProtoAtLeast(1, 1) && ((!haveHost || len(hosts) == 0) && len(req.Host) == 0) && !isH2Upgrade {
 		return nil, badRequestError("missing required Host header")
 	}
 	if len(hosts) > 1 {
