@@ -557,19 +557,24 @@ func decodeIntoValue(state *decoderState, op decOp, isPtr bool, value reflect.Va
 // Because the internals of maps are not visible to us, we must
 // use reflection rather than pointer magic.
 func (dec *Decoder) decodeMap(mtyp reflect.Type, state *decoderState, value reflect.Value, keyOp, elemOp decOp, ovfl error) {
-	if value.IsNil() {
-		// Allocate map.
-		value.Set(reflect.MakeMap(mtyp))
-	}
 	n := int(state.decodeUint())
+	if value.IsNil() {
+		value.Set(reflect.MakeMapWithSize(mtyp, n))
+	}
 	keyIsPtr := mtyp.Key().Kind() == reflect.Ptr
 	elemIsPtr := mtyp.Elem().Kind() == reflect.Ptr
 	keyInstr := &decInstr{keyOp, 0, nil, ovfl}
 	elemInstr := &decInstr{elemOp, 0, nil, ovfl}
+	keyP := reflect.New(mtyp.Key())
+	keyZ := reflect.Zero(mtyp.Key())
+	elemP := reflect.New(mtyp.Elem())
+	elemZ := reflect.Zero(mtyp.Elem())
 	for i := 0; i < n; i++ {
-		key := decodeIntoValue(state, keyOp, keyIsPtr, allocValue(mtyp.Key()), keyInstr)
-		elem := decodeIntoValue(state, elemOp, elemIsPtr, allocValue(mtyp.Elem()), elemInstr)
+		key := decodeIntoValue(state, keyOp, keyIsPtr, keyP.Elem(), keyInstr)
+		elem := decodeIntoValue(state, elemOp, elemIsPtr, elemP.Elem(), elemInstr)
 		value.SetMapIndex(key, elem)
+		keyP.Elem().Set(keyZ)
+		elemP.Elem().Set(elemZ)
 	}
 }
 
@@ -655,12 +660,12 @@ func (dec *Decoder) decodeInterface(ityp reflect.Type, state *decoderState, valu
 		errorf("name too long (%d bytes): %.20q...", len(name), name)
 	}
 	// The concrete type must be registered.
-	registerLock.RLock()
-	typ, ok := nameToConcreteType[string(name)]
-	registerLock.RUnlock()
+	typi, ok := nameToConcreteType.Load(string(name))
 	if !ok {
 		errorf("name not registered for interface: %q", name)
 	}
+	typ := typi.(reflect.Type)
+
 	// Read the type id of the concrete value.
 	concreteId := dec.decodeTypeSequence(true)
 	if concreteId < 0 {

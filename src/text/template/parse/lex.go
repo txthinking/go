@@ -60,6 +60,8 @@ const (
 	// Keywords appear after all the rest.
 	itemKeyword  // used only to delimit the keywords
 	itemBlock    // block keyword
+	itemBreak    // break keyword
+	itemContinue // continue keyword
 	itemDot      // the cursor, spelled '.'
 	itemDefine   // define keyword
 	itemElse     // else keyword
@@ -74,6 +76,8 @@ const (
 var key = map[string]itemType{
 	".":        itemDot,
 	"block":    itemBlock,
+	"break":    itemBreak,
+	"continue": itemContinue,
 	"define":   itemDefine,
 	"else":     itemElse,
 	"end":      itemEnd,
@@ -164,6 +168,7 @@ func (l *lexer) emit(t itemType) {
 
 // ignore skips over the pending input before this point.
 func (l *lexer) ignore() {
+	l.line += strings.Count(l.input[l.start:l.pos], "\n")
 	l.start = l.pos
 }
 
@@ -281,10 +286,9 @@ func (l *lexer) atRightDelim() (delim, trimSpaces bool) {
 		return true, false
 	}
 	// The right delim might have the marker before.
-	if strings.HasPrefix(l.input[l.pos:], rightTrimMarker) {
-		if strings.HasPrefix(l.input[l.pos+trimMarkerLen:], l.rightDelim) {
-			return true, true
-		}
+	if strings.HasPrefix(l.input[l.pos:], rightTrimMarker) &&
+		strings.HasPrefix(l.input[l.pos+trimMarkerLen:], l.rightDelim) {
+		return true, true
 	}
 	return false, false
 }

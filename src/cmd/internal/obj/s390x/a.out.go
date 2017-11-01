@@ -138,7 +138,6 @@ const (
 
 	REG_RESERVED // end of allocated registers
 
-	REGZERO = REG_R0  // set to zero
 	REGARG  = -1      // -1 disables passing the first argument in register
 	REGRT1  = REG_R3  // used during zeroing of the stack - not reserved
 	REGRT2  = REG_R4  // used during zeroing of the stack - not reserved
@@ -284,12 +283,19 @@ const (
 	AFNEGS
 	ALEDBR
 	ALDEBR
+	ALPDFR
+	ALNDFR
 	AFSUB
 	AFSUBS
 	AFSQRT
 	AFSQRTS
 	AFIEBR
 	AFIDBR
+	ACPSDR
+
+	// move from GPR to FPR and vice versa
+	ALDGR
+	ALGDR
 
 	// convert from int32/int64 to float/float64
 	ACEFBRA
@@ -320,6 +326,12 @@ const (
 	ACMPU
 	ACMPW
 	ACMPWU
+
+	// test under mask
+	ATMHH
+	ATMHL
+	ATMLH
+	ATMLL
 
 	// compare and swap
 	ACS

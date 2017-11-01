@@ -28,9 +28,6 @@ type netFD struct {
 	raddr       Addr
 }
 
-func sysInit() {
-}
-
 func newFD(sysfd, family, sotype int, net string) (*netFD, error) {
 	ret := &netFD{
 		pfd: poll.FD{
@@ -46,7 +43,7 @@ func newFD(sysfd, family, sotype int, net string) (*netFD, error) {
 }
 
 func (fd *netFD) init() error {
-	return fd.pfd.Init()
+	return fd.pfd.Init(fd.net, true)
 }
 
 func (fd *netFD) setAddr(laddr, raddr Addr) {
@@ -66,7 +63,7 @@ func (fd *netFD) name() string {
 	return fd.net + ":" + ls + "->" + rs
 }
 
-func (fd *netFD) connect(ctx context.Context, la, ra syscall.Sockaddr) (ret error) {
+func (fd *netFD) connect(ctx context.Context, la, ra syscall.Sockaddr) (rsa syscall.Sockaddr, ret error) {
 	// Do not need to call fd.writeLock here,
 	// because fd is not yet accessible to user,
 	// so no concurrent operations are possible.
@@ -75,14 +72,14 @@ func (fd *netFD) connect(ctx context.Context, la, ra syscall.Sockaddr) (ret erro
 	case nil, syscall.EISCONN:
 		select {
 		case <-ctx.Done():
-			return mapErr(ctx.Err())
+			return nil, mapErr(ctx.Err())
 		default:
 		}
-		if err := fd.pfd.Init(); err != nil {
-			return err
+		if err := fd.pfd.Init(fd.net, true); err != nil {
+			return nil, err
 		}
 		runtime.KeepAlive(fd)
-		return nil
+		return nil, nil
 	case syscall.EINVAL:
 		// On Solaris we can see EINVAL if the socket has
 		// already been accepted and closed by the server.
@@ -90,14 +87,14 @@ func (fd *netFD) connect(ctx context.Context, la, ra syscall.Sockaddr) (ret erro
 		// the socket will see EOF.  For details and a test
 		// case in C see https://golang.org/issue/6828.
 		if runtime.GOOS == "solaris" {
-			return nil
+			return nil, nil
 		}
 		fallthrough
 	default:
-		return os.NewSyscallError("connect", err)
+		return nil, os.NewSyscallError("connect", err)
 	}
-	if err := fd.pfd.Init(); err != nil {
-		return err
+	if err := fd.pfd.Init(fd.net, true); err != nil {
+		return nil, err
 	}
 	if deadline, _ := ctx.Deadline(); !deadline.IsZero() {
 		fd.pfd.SetWriteDeadline(deadline)
@@ -155,30 +152,28 @@ func (fd *netFD) connect(ctx context.Context, la, ra syscall.Sockaddr) (ret erro
 		if err := fd.pfd.WaitWrite(); err != nil {
 			select {
 			case <-ctx.Done():
-				return mapErr(ctx.Err())
+				return nil, mapErr(ctx.Err())
 			default:
 			}
-			return err
+			return nil, err
 		}
 		nerr, err := getsockoptIntFunc(fd.pfd.Sysfd, syscall.SOL_SOCKET, syscall.SO_ERROR)
 		if err != nil {
-			return os.NewSyscallError("getsockopt", err)
+			return nil, os.NewSyscallError("getsockopt", err)
 		}
 		switch err := syscall.Errno(nerr); err {
 		case syscall.EINPROGRESS, syscall.EALREADY, syscall.EINTR:
-		case syscall.Errno(0), syscall.EISCONN:
-			if runtime.GOOS != "darwin" {
-				return nil
-			}
-			// See golang.org/issue/14548.
-			// On Darwin, multiple connect system calls on
-			// a non-blocking socket never harm SO_ERROR.
-			switch err := connectFunc(fd.pfd.Sysfd, ra); err {
-			case nil, syscall.EISCONN:
-				return nil
+		case syscall.EISCONN:
+			return nil, nil
+		case syscall.Errno(0):
+			// The runtime poller can wake us up spuriously;
+			// see issues 14548 and 19289. Check that we are
+			// really connected; if not, wait again.
+			if rsa, err := syscall.Getpeername(fd.pfd.Sysfd); err == nil {
+				return rsa, nil
 			}
 		default:
-			return os.NewSyscallError("getsockopt", err)
+			return nil, os.NewSyscallError("getsockopt", err)
 		}
 		runtime.KeepAlive(fd)
 	}
@@ -210,7 +205,7 @@ func (fd *netFD) Read(p []byte) (n int, err error) {
 }
 
 func (fd *netFD) readFrom(p []byte) (n int, sa syscall.Sockaddr, err error) {
-	n, sa, err = fd.pfd.RecvFrom(p)
+	n, sa, err = fd.pfd.ReadFrom(p)
 	runtime.KeepAlive(fd)
 	return n, sa, wrapSyscallError("recvfrom", err)
 }

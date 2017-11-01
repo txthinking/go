@@ -239,7 +239,7 @@ var comms = []test{
 
 func TestPos(t *testing.T) {
 	// TODO(gri) Once we have a general tree walker, we can use that to find
-	// the first occurence of the respective node and we don't need to hand-
+	// the first occurrence of the respective node and we don't need to hand-
 	// extract the node for each specific kind of construct.
 
 	testPos(t, decls, "package p; ", "",
@@ -291,7 +291,7 @@ func testPos(t *testing.T, list []test, prefix, suffix string, extract func(*Fil
 		}
 
 		// build syntaxt tree
-		file, err := ParseBytes(nil, []byte(src), nil, nil, 0)
+		file, err := ParseBytes(nil, []byte(src), nil, nil, nil, 0)
 		if err != nil {
 			t.Errorf("parse error: %s: %v (%s)", src, err, test.nodetyp)
 			continue

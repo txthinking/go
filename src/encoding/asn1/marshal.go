@@ -18,7 +18,7 @@ var (
 	byteFFEncoder encoder = byteEncoder(0xff)
 )
 
-// encoder represents a ASN.1 element that is waiting to be marshaled.
+// encoder represents an ASN.1 element that is waiting to be marshaled.
 type encoder interface {
 	// Len returns the number of bytes needed to marshal this element.
 	Len() int
@@ -268,7 +268,10 @@ func makeObjectIdentifier(oid []int) (e encoder, err error) {
 
 func makePrintableString(s string) (e encoder, err error) {
 	for i := 0; i < len(s); i++ {
-		if !isPrintable(s[i]) {
+		// The asterisk is often used in PrintableString, even though
+		// it is invalid. If a PrintableString was specifically
+		// requested then the asterisk is permitted by this code.
+		if !isPrintable(s[i], allowAsterisk) {
 			return nil, StructuralError{"PrintableString contains invalid character"}
 		}
 	}
@@ -556,11 +559,10 @@ func makeField(v reflect.Value, params fieldParameters) (e encoder, err error) {
 		return t, nil
 	}
 
-	tag, isCompound, ok := getUniversalType(v.Type())
-	if !ok {
+	matchAny, tag, isCompound, ok := getUniversalType(v.Type())
+	if !ok || matchAny {
 		return nil, StructuralError{fmt.Sprintf("unknown Go type: %v", v.Type())}
 	}
-	class := ClassUniversal
 
 	if params.timeType != 0 && tag != TagUTCTime {
 		return nil, StructuralError{"explicit time type given to non-time member"}
@@ -577,7 +579,7 @@ func makeField(v reflect.Value, params fieldParameters) (e encoder, err error) {
 			// a PrintableString if the character set in the string is
 			// sufficiently limited, otherwise we'll use a UTF8String.
 			for _, r := range v.String() {
-				if r >= utf8.RuneSelf || !isPrintable(byte(r)) {
+				if r >= utf8.RuneSelf || !isPrintable(byte(r), rejectAsterisk) {
 					if !utf8.ValidString(v.String()) {
 						return nil, errors.New("asn1: string not valid UTF-8")
 					}
@@ -610,27 +612,33 @@ func makeField(v reflect.Value, params fieldParameters) (e encoder, err error) {
 
 	bodyLen := t.body.Len()
 
-	if params.explicit {
-		t.tag = bytesEncoder(appendTagAndLength(t.scratch[:0], tagAndLength{class, tag, bodyLen, isCompound}))
-
-		tt := new(taggedEncoder)
-
-		tt.body = t
-
-		tt.tag = bytesEncoder(appendTagAndLength(tt.scratch[:0], tagAndLength{
-			class:      ClassContextSpecific,
-			tag:        *params.tag,
-			length:     bodyLen + t.tag.Len(),
-			isCompound: true,
-		}))
-
-		return tt, nil
-	}
-
+	class := ClassUniversal
 	if params.tag != nil {
+		if params.application {
+			class = ClassApplication
+		} else {
+			class = ClassContextSpecific
+		}
+
+		if params.explicit {
+			t.tag = bytesEncoder(appendTagAndLength(t.scratch[:0], tagAndLength{ClassUniversal, tag, bodyLen, isCompound}))
+
+			tt := new(taggedEncoder)
+
+			tt.body = t
+
+			tt.tag = bytesEncoder(appendTagAndLength(tt.scratch[:0], tagAndLength{
+				class:      class,
+				tag:        *params.tag,
+				length:     bodyLen + t.tag.Len(),
+				isCompound: true,
+			}))
+
+			return tt, nil
+		}
+
 		// implicit tag.
 		tag = *params.tag
-		class = ClassContextSpecific
 	}
 
 	t.tag = bytesEncoder(appendTagAndLength(t.scratch[:0], tagAndLength{class, tag, bodyLen, isCompound}))
@@ -643,10 +651,12 @@ func makeField(v reflect.Value, params fieldParameters) (e encoder, err error) {
 // In addition to the struct tags recognised by Unmarshal, the following can be
 // used:
 //
-//	ia5:		causes strings to be marshaled as ASN.1, IA5 strings
-//	omitempty:	causes empty slices to be skipped
-//	printable:	causes strings to be marshaled as ASN.1, PrintableString strings.
-//	utf8:		causes strings to be marshaled as ASN.1, UTF8 strings
+//	ia5:         causes strings to be marshaled as ASN.1, IA5String values
+//	omitempty:   causes empty slices to be skipped
+//	printable:   causes strings to be marshaled as ASN.1, PrintableString values
+//	utf8:        causes strings to be marshaled as ASN.1, UTF8String values
+//	utc:         causes time.Time to be marshaled as ASN.1, UTCTime values
+//	generalized: causes time.Time to be marshaled as ASN.1, GeneralizedTime values
 func Marshal(val interface{}) ([]byte, error) {
 	e, err := makeField(reflect.ValueOf(val), fieldParameters{})
 	if err != nil {

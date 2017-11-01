@@ -142,6 +142,40 @@ func testMultiWriter(t *testing.T, sink interface {
 	}
 }
 
+// writerFunc is an io.Writer implemented by the underlying func.
+type writerFunc func(p []byte) (int, error)
+
+func (f writerFunc) Write(p []byte) (int, error) {
+	return f(p)
+}
+
+// Test that MultiWriter properly flattens chained multiWriters,
+func TestMultiWriterSingleChainFlatten(t *testing.T) {
+	pc := make([]uintptr, 1000) // 1000 should fit the full stack
+	n := runtime.Callers(0, pc)
+	var myDepth = callDepth(pc[:n])
+	var writeDepth int // will contain the depth from which writerFunc.Writer was called
+	var w Writer = MultiWriter(writerFunc(func(p []byte) (int, error) {
+		n := runtime.Callers(1, pc)
+		writeDepth += callDepth(pc[:n])
+		return 0, nil
+	}))
+
+	mw := w
+	// chain a bunch of multiWriters
+	for i := 0; i < 100; i++ {
+		mw = MultiWriter(w)
+	}
+
+	mw = MultiWriter(w, mw, w, mw)
+	mw.Write(nil) // don't care about errors, just want to check the call-depth for Write
+
+	if writeDepth != 4*(myDepth+2) { // 2 should be multiWriter.Write and writerFunc.Write
+		t.Errorf("multiWriter did not flatten chained multiWriters: expected writeDepth %d, got %d",
+			4*(myDepth+2), writeDepth)
+	}
+}
+
 // Test that MultiReader copies the input slice and is insulated from future modification.
 func TestMultiReaderCopy(t *testing.T) {
 	slice := []Reader{strings.NewReader("hello world")}
@@ -175,13 +209,26 @@ func (f readerFunc) Read(p []byte) (int, error) {
 	return f(p)
 }
 
+// callDepth returns the logical call depth for the given PCs.
+func callDepth(callers []uintptr) (depth int) {
+	frames := runtime.CallersFrames(callers)
+	more := true
+	for more {
+		_, more = frames.Next()
+		depth++
+	}
+	return
+}
+
 // Test that MultiReader properly flattens chained multiReaders when Read is called
 func TestMultiReaderFlatten(t *testing.T) {
 	pc := make([]uintptr, 1000) // 1000 should fit the full stack
-	var myDepth = runtime.Callers(0, pc)
+	n := runtime.Callers(0, pc)
+	var myDepth = callDepth(pc[:n])
 	var readDepth int // will contain the depth from which fakeReader.Read was called
 	var r Reader = MultiReader(readerFunc(func(p []byte) (int, error) {
-		readDepth = runtime.Callers(1, pc)
+		n := runtime.Callers(1, pc)
+		readDepth = callDepth(pc[:n])
 		return 0, errors.New("irrelevant")
 	}))
 

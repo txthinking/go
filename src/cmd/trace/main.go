@@ -42,11 +42,18 @@ Supported profile types are:
 Flags:
 	-http=addr: HTTP service address (e.g., ':6060')
 	-pprof=type: print a pprof-like profile instead
+	-d: print debug info such as parsed events
+
+Note that while the various profiles available when launching
+'go tool trace' work on every browser, the trace viewer itself
+(the 'view trace' page) comes from the Chrome/Chromium project
+and is only actively tested on that browser.
 `
 
 var (
 	httpFlag  = flag.String("http", "localhost:0", "HTTP service address (e.g., ':6060')")
 	pprofFlag = flag.String("pprof", "", "print a pprof-like profile instead")
+	debugFlag = flag.Bool("d", false, "print debug information such as parsed events list")
 
 	// The binary file name, left here for serveSVGProfile.
 	programBinary string
@@ -98,13 +105,18 @@ func main() {
 		dief("failed to create server socket: %v\n", err)
 	}
 
-	log.Printf("Parsing trace...")
+	log.Print("Parsing trace...")
 	events, err := parseEvents()
 	if err != nil {
 		dief("%v\n", err)
 	}
 
-	log.Printf("Serializing trace...")
+	if *debugFlag {
+		trace.Print(events)
+		os.Exit(0)
+	}
+
+	log.Print("Serializing trace...")
 	params := &traceParams{
 		events:  events,
 		endTime: int64(1<<63 - 1),
@@ -114,13 +126,12 @@ func main() {
 		dief("%v\n", err)
 	}
 
-	log.Printf("Splitting trace...")
+	log.Print("Splitting trace...")
 	ranges = splitTrace(data)
 
-	log.Printf("Opening browser")
-	if !browser.Open("http://" + ln.Addr().String()) {
-		fmt.Fprintf(os.Stderr, "Trace viewer is listening on http://%s\n", ln.Addr().String())
-	}
+	addr := "http://" + ln.Addr().String()
+	log.Printf("Opening browser. Trace viewer is listening on %s", addr)
+	browser.Open(addr)
 
 	// Start http server.
 	http.HandleFunc("/", httpMain)

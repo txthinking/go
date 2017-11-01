@@ -5,6 +5,7 @@
 package os
 
 import (
+	"internal/poll"
 	"io"
 	"runtime"
 	"syscall"
@@ -35,7 +36,9 @@ func (f *File) Fd() uintptr {
 	return uintptr(f.fd)
 }
 
-// NewFile returns a new File with the given file descriptor and name.
+// NewFile returns a new File with the given file descriptor and
+// name. The returned value will be nil if fd is not a valid file
+// descriptor.
 func NewFile(fd uintptr, name string) *File {
 	fdi := int(fd)
 	if fdi < 0 {
@@ -194,9 +197,7 @@ func (f *File) Truncate(size int64) error {
 
 const chmodMask = uint32(syscall.DMAPPEND | syscall.DMEXCL | syscall.DMTMP | ModePerm)
 
-// Chmod changes the mode of the file to mode.
-// If there is an error, it will be of type *PathError.
-func (f *File) Chmod(mode FileMode) error {
+func (f *File) chmod(mode FileMode) error {
 	if f == nil {
 		return ErrInvalid
 	}
@@ -373,10 +374,8 @@ func rename(oldname, newname string) error {
 	return nil
 }
 
-// Chmod changes the mode of the named file to mode.
-// If the file is a symbolic link, it changes the mode of the link's target.
-// If there is an error, it will be of type *PathError.
-func Chmod(name string, mode FileMode) error {
+// See docs in file.go:Chmod.
+func chmod(name string, mode FileMode) error {
 	var d syscall.Dir
 
 	odir, e := dirstat(name)
@@ -476,8 +475,7 @@ func (f *File) Chown(uid, gid int) error {
 	return &PathError{"chown", f.name, syscall.EPLAN9}
 }
 
-// TempDir returns the default directory to use for temporary files.
-func TempDir() string {
+func tempDir() string {
 	return "/tmp"
 }
 
@@ -492,6 +490,30 @@ func (f *File) Chdir() error {
 		return &PathError{"chdir", f.name, e}
 	}
 	return nil
+}
+
+// setDeadline sets the read and write deadline.
+func (f *File) setDeadline(time.Time) error {
+	if err := f.checkValid("SetDeadline"); err != nil {
+		return err
+	}
+	return poll.ErrNoDeadline
+}
+
+// setReadDeadline sets the read deadline.
+func (f *File) setReadDeadline(time.Time) error {
+	if err := f.checkValid("SetReadDeadline"); err != nil {
+		return err
+	}
+	return poll.ErrNoDeadline
+}
+
+// setWriteDeadline sets the write deadline.
+func (f *File) setWriteDeadline(time.Time) error {
+	if err := f.checkValid("SetWriteDeadline"); err != nil {
+		return err
+	}
+	return poll.ErrNoDeadline
 }
 
 // checkValid checks whether f is valid for use.

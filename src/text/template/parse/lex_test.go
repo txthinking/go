@@ -192,7 +192,7 @@ var lexTests = []lexTest{
 		tRight,
 		tEOF,
 	}},
-	{"keywords", "{{range if else end with}}", []item{
+	{"keywords", "{{range if else end with break continue}}", []item{
 		tLeft,
 		mkItem(itemRange, "range"),
 		tSpace,
@@ -203,6 +203,10 @@ var lexTests = []lexTest{
 		mkItem(itemEnd, "end"),
 		tSpace,
 		mkItem(itemWith, "with"),
+		tSpace,
+		mkItem(itemBreak, "break"),
+		tSpace,
+		mkItem(itemContinue, "continue"),
 		tRight,
 		tEOF,
 	}},
@@ -404,6 +408,9 @@ func equal(i1, i2 []item, checkPos bool) bool {
 		if checkPos && i1[k].pos != i2[k].pos {
 			return false
 		}
+		if checkPos && i1[k].line != i2[k].line {
+			return false
+		}
 	}
 	return true
 }
@@ -452,7 +459,7 @@ func TestDelims(t *testing.T) {
 }
 
 var lexPosTests = []lexTest{
-	{"empty", "", []item{tEOF}},
+	{"empty", "", []item{{itemEOF, 0, "", 1}}},
 	{"punctuation", "{{,@%#}}", []item{
 		{itemLeftDelim, 0, "{{", 1},
 		{itemChar, 2, ",", 1},
@@ -470,6 +477,24 @@ var lexPosTests = []lexTest{
 		{itemText, 13, "xyz", 1},
 		{itemEOF, 16, "", 1},
 	}},
+	{"trimafter", "{{x -}}\n{{y}}", []item{
+		{itemLeftDelim, 0, "{{", 1},
+		{itemIdentifier, 2, "x", 1},
+		{itemRightDelim, 5, "}}", 1},
+		{itemLeftDelim, 8, "{{", 2},
+		{itemIdentifier, 10, "y", 2},
+		{itemRightDelim, 11, "}}", 2},
+		{itemEOF, 13, "", 2},
+	}},
+	{"trimbefore", "{{x}}\n{{- y}}", []item{
+		{itemLeftDelim, 0, "{{", 1},
+		{itemIdentifier, 2, "x", 1},
+		{itemRightDelim, 3, "}}", 1},
+		{itemLeftDelim, 6, "{{", 2},
+		{itemIdentifier, 10, "y", 2},
+		{itemRightDelim, 11, "}}", 2},
+		{itemEOF, 13, "", 2},
+	}},
 }
 
 // The other tests don't check position, to make the test cases easier to construct.
@@ -485,7 +510,8 @@ func TestPos(t *testing.T) {
 					if !equal(items[i:i+1], test.items[i:i+1], true) {
 						i1 := items[i]
 						i2 := test.items[i]
-						t.Errorf("\t#%d: got {%v %d %q} expected  {%v %d %q}", i, i1.typ, i1.pos, i1.val, i2.typ, i2.pos, i2.val)
+						t.Errorf("\t#%d: got {%v %d %q %d} expected {%v %d %q %d}",
+							i, i1.typ, i1.pos, i1.val, i1.line, i2.typ, i2.pos, i2.val, i2.line)
 					}
 				}
 			}
@@ -498,7 +524,7 @@ func TestShutdown(t *testing.T) {
 	// We need to duplicate template.Parse here to hold on to the lexer.
 	const text = "erroneous{{define}}{{else}}1234"
 	lexer := lex("foo", text, "{{", "}}")
-	_, err := New("root").parseLexer(lexer, text)
+	_, err := New("root").parseLexer(lexer)
 	if err == nil {
 		t.Fatalf("expected error")
 	}
@@ -511,7 +537,7 @@ func TestShutdown(t *testing.T) {
 
 // parseLexer is a local version of parse that lets us pass in the lexer instead of building it.
 // We expect an error, so the tree set and funcs list are explicitly nil.
-func (t *Tree) parseLexer(lex *lexer, text string) (tree *Tree, err error) {
+func (t *Tree) parseLexer(lex *lexer) (tree *Tree, err error) {
 	defer t.recover(&err)
 	t.ParseName = t.Name
 	t.startParse(nil, lex, map[string]*Tree{})

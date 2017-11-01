@@ -10,6 +10,7 @@ import (
 	"io/ioutil"
 	"math/rand"
 	"os"
+	"strings"
 	"testing"
 )
 
@@ -57,8 +58,8 @@ var writeTests = []WriteTest{
 
 func TestWriter(t *testing.T) {
 	largeData := make([]byte, 1<<17)
-	for i := range largeData {
-		largeData[i] = byte(rand.Int())
+	if _, err := rand.Read(largeData); err != nil {
+		t.Fatal("rand.Read failed:", err)
 	}
 	writeTests[1].Data = largeData
 	defer func() {
@@ -87,10 +88,121 @@ func TestWriter(t *testing.T) {
 	}
 }
 
+// TestWriterComment is test for EOCD comment read/write.
+func TestWriterComment(t *testing.T) {
+	var tests = []struct {
+		comment string
+		ok      bool
+	}{
+		{"hi, hello", true},
+		{"hi, こんにちわ", true},
+		{strings.Repeat("a", uint16max), true},
+		{strings.Repeat("a", uint16max+1), false},
+	}
+
+	for _, test := range tests {
+		// write a zip file
+		buf := new(bytes.Buffer)
+		w := NewWriter(buf)
+		w.Comment = test.comment
+
+		if err := w.Close(); test.ok == (err != nil) {
+			t.Fatal(err)
+		}
+
+		if w.closed != test.ok {
+			t.Fatalf("Writer.closed: got %v, want %v", w.closed, test.ok)
+		}
+
+		// skip read test in failure cases
+		if !test.ok {
+			continue
+		}
+
+		// read it back
+		r, err := NewReader(bytes.NewReader(buf.Bytes()), int64(buf.Len()))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if r.Comment != test.comment {
+			t.Fatalf("Reader.Comment: got %v, want %v", r.Comment, test.comment)
+		}
+	}
+}
+
+func TestWriterUTF8(t *testing.T) {
+	var utf8Tests = []struct {
+		name    string
+		comment string
+		expect  uint16
+	}{
+		{
+			name:    "hi, hello",
+			comment: "in the world",
+			expect:  0x8,
+		},
+		{
+			name:    "hi, こんにちわ",
+			comment: "in the world",
+			expect:  0x808,
+		},
+		{
+			name:    "hi, hello",
+			comment: "in the 世界",
+			expect:  0x808,
+		},
+		{
+			name:    "hi, こんにちわ",
+			comment: "in the 世界",
+			expect:  0x808,
+		},
+		{
+			// Name is Japanese encoded in Shift JIS.
+			name:    "\x93\xfa\x96{\x8c\xea.txt",
+			comment: "in the 世界",
+			expect:  0x008, // UTF-8 must not be set
+		},
+	}
+
+	// write a zip file
+	buf := new(bytes.Buffer)
+	w := NewWriter(buf)
+
+	for _, test := range utf8Tests {
+		h := &FileHeader{
+			Name:    test.name,
+			Comment: test.comment,
+			Method:  Deflate,
+		}
+		w, err := w.CreateHeader(h)
+		if err != nil {
+			t.Fatal(err)
+		}
+		w.Write([]byte{})
+	}
+
+	if err := w.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	// read it back
+	r, err := NewReader(bytes.NewReader(buf.Bytes()), int64(buf.Len()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i, test := range utf8Tests {
+		got := r.File[i].Flags
+		t.Logf("name %v, comment %v", test.name, test.comment)
+		if got != test.expect {
+			t.Fatalf("Flags: got %v, want %v", got, test.expect)
+		}
+	}
+}
+
 func TestWriterOffset(t *testing.T) {
 	largeData := make([]byte, 1<<17)
-	for i := range largeData {
-		largeData[i] = byte(rand.Int())
+	if _, err := rand.Read(largeData); err != nil {
+		t.Fatal("rand.Read failed:", err)
 	}
 	writeTests[1].Data = largeData
 	defer func() {

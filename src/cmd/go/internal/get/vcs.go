@@ -93,6 +93,7 @@ var vcsList = []*vcsCmd{
 	vcsGit,
 	vcsSvn,
 	vcsBzr,
+	vcsFossil,
 }
 
 // vcsByCmd returns the version control system for the given
@@ -302,15 +303,20 @@ func svnRemoteRepo(vcsSvn *vcsCmd, rootDir string) (remoteRepo string, err error
 	out := string(outb)
 
 	// Expect:
-	// ...
-	// Repository Root: <URL>
-	// ...
-
-	i := strings.Index(out, "\nRepository Root: ")
+	//
+	//	 ...
+	// 	URL: <URL>
+	// 	...
+	//
+	// Note that we're not using the Repository Root line,
+	// because svn allows checking out subtrees.
+	// The URL will be the URL of the subtree (what we used with 'svn co')
+	// while the Repository Root may be a much higher parent.
+	i := strings.Index(out, "\nURL: ")
 	if i < 0 {
 		return "", fmt.Errorf("unable to parse output of svn info")
 	}
-	out = out[i+len("\nRepository Root: "):]
+	out = out[i+len("\nURL: "):]
 	i = strings.Index(out, "\n")
 	if i < 0 {
 		return "", fmt.Errorf("unable to parse output of svn info")
@@ -319,12 +325,40 @@ func svnRemoteRepo(vcsSvn *vcsCmd, rootDir string) (remoteRepo string, err error
 	return strings.TrimSpace(out), nil
 }
 
+// fossilRepoName is the name go get associates with a fossil repository. In the
+// real world the file can be named anything.
+const fossilRepoName = ".fossil"
+
+// vcsFossil describes how to use Fossil (fossil-scm.org)
+var vcsFossil = &vcsCmd{
+	name: "Fossil",
+	cmd:  "fossil",
+
+	createCmd:   []string{"-go-internal-mkdir {dir} clone {repo} " + filepath.Join("{dir}", fossilRepoName), "-go-internal-cd {dir} open .fossil"},
+	downloadCmd: []string{"up"},
+
+	tagCmd:         []tagCmd{{"tag ls", `(.*)`}},
+	tagSyncCmd:     []string{"up tag:{tag}"},
+	tagSyncDefault: []string{"up trunk"},
+
+	scheme:     []string{"https", "http"},
+	remoteRepo: fossilRemoteRepo,
+}
+
+func fossilRemoteRepo(vcsFossil *vcsCmd, rootDir string) (remoteRepo string, err error) {
+	out, err := vcsFossil.runOutput(rootDir, "remote-url")
+	if err != nil {
+		return "", err
+	}
+	return strings.TrimSpace(string(out)), nil
+}
+
 func (v *vcsCmd) String() string {
 	return v.name
 }
 
 // run runs the command line cmd in the given directory.
-// keyval is a list of key, value pairs.  run expands
+// keyval is a list of key, value pairs. run expands
 // instances of {key} in cmd into value, but only after
 // splitting cmd into individual arguments.
 // If an error occurs, run prints the command line and the
@@ -355,6 +389,19 @@ func (v *vcsCmd) run1(dir string, cmdline string, keyval []string, verbose bool)
 	args := strings.Fields(cmdline)
 	for i, arg := range args {
 		args[i] = expand(m, arg)
+	}
+
+	if len(args) >= 2 && args[0] == "-go-internal-mkdir" {
+		var err error
+		if filepath.IsAbs(args[1]) {
+			err = os.Mkdir(args[1], os.ModePerm)
+		} else {
+			err = os.Mkdir(filepath.Join(dir, args[1]), os.ModePerm)
+		}
+		if err != nil {
+			return nil, err
+		}
+		args = args[2:]
 	}
 
 	if len(args) >= 2 && args[0] == "-go-internal-cd" {
@@ -501,11 +548,28 @@ func vcsFromDir(dir, srcRoot string) (vcs *vcsCmd, root string, err error) {
 		return nil, "", fmt.Errorf("directory %q is outside source root %q", dir, srcRoot)
 	}
 
+	var vcsRet *vcsCmd
+	var rootRet string
+
 	origDir := dir
 	for len(dir) > len(srcRoot) {
 		for _, vcs := range vcsList {
 			if _, err := os.Stat(filepath.Join(dir, "."+vcs.cmd)); err == nil {
-				return vcs, filepath.ToSlash(dir[len(srcRoot)+1:]), nil
+				root := filepath.ToSlash(dir[len(srcRoot)+1:])
+				// Record first VCS we find, but keep looking,
+				// to detect mistakes like one kind of VCS inside another.
+				if vcsRet == nil {
+					vcsRet = vcs
+					rootRet = root
+					continue
+				}
+				// Allow .git inside .git, which can arise due to submodules.
+				if vcsRet == vcs && vcs.cmd == "git" {
+					continue
+				}
+				// Otherwise, we have one VCS inside a different VCS.
+				return nil, "", fmt.Errorf("directory %q uses %s, but parent %q uses %s",
+					filepath.Join(srcRoot, rootRet), vcsRet.cmd, filepath.Join(srcRoot, root), vcs.cmd)
 			}
 		}
 
@@ -518,7 +582,46 @@ func vcsFromDir(dir, srcRoot string) (vcs *vcsCmd, root string, err error) {
 		dir = ndir
 	}
 
+	if vcsRet != nil {
+		return vcsRet, rootRet, nil
+	}
+
 	return nil, "", fmt.Errorf("directory %q is not using a known version control system", origDir)
+}
+
+// checkNestedVCS checks for an incorrectly-nested VCS-inside-VCS
+// situation for dir, checking parents up until srcRoot.
+func checkNestedVCS(vcs *vcsCmd, dir, srcRoot string) error {
+	if len(dir) <= len(srcRoot) || dir[len(srcRoot)] != filepath.Separator {
+		return fmt.Errorf("directory %q is outside source root %q", dir, srcRoot)
+	}
+
+	otherDir := dir
+	for len(otherDir) > len(srcRoot) {
+		for _, otherVCS := range vcsList {
+			if _, err := os.Stat(filepath.Join(otherDir, "."+otherVCS.cmd)); err == nil {
+				// Allow expected vcs in original dir.
+				if otherDir == dir && otherVCS == vcs {
+					continue
+				}
+				// Allow .git inside .git, which can arise due to submodules.
+				if otherVCS == vcs && vcs.cmd == "git" {
+					continue
+				}
+				// Otherwise, we have one VCS inside a different VCS.
+				return fmt.Errorf("directory %q uses %s, but parent %q uses %s", dir, vcs.cmd, otherDir, otherVCS.cmd)
+			}
+		}
+		// Move to parent.
+		newDir := filepath.Dir(otherDir)
+		if len(newDir) >= len(otherDir) {
+			// Shouldn't happen, but just in case, stop.
+			break
+		}
+		otherDir = newDir
+	}
+
+	return nil
 }
 
 // repoRoot represents a version control system, a repo, and a root of
@@ -688,7 +791,7 @@ func repoRootForImportDynamic(importPath string, security web.SecurityMode) (*re
 	// prefix was "uni.edu" and the RepoRoot was "evilroot.com",
 	// make sure we don't trust Bob and check out evilroot.com to
 	// "uni.edu" yet (possibly overwriting/preempting another
-	// non-evil student).  Instead, first verify the root and see
+	// non-evil student). Instead, first verify the root and see
 	// if it matches Bob's claim.
 	if mmi.Prefix != importPath {
 		if cfg.BuildV {
@@ -851,7 +954,7 @@ var vcsPaths = []*vcsPath{
 	// Github
 	{
 		prefix: "github.com/",
-		re:     `^(?P<root>github\.com/[A-Za-z0-9_.\-]+/[A-Za-z0-9_.\-]+)(/[A-Za-z0-9_.\-]+)*$`,
+		re:     `^(?P<root>github\.com/[A-Za-z0-9_.\-]+/[A-Za-z0-9_.\-]+)(/[\p{L}0-9_.\-]+)*$`,
 		vcs:    "git",
 		repo:   "https://{root}",
 		check:  noVCSSuffix,
@@ -890,10 +993,18 @@ var vcsPaths = []*vcsPath{
 		repo:   "https://{root}",
 	},
 
+	// chiselapp.com for fossil
+	{
+		prefix: "chiselapp.com",
+		re:     `^(?P<root>chiselapp\.com/user/[A-Za-z0-9]+/repository/[A-Za-z0-9_.\-]+)$`,
+		vcs:    "fossil",
+		repo:   "https://{root}",
+	},
+
 	// General syntax for any server.
 	// Must be last.
 	{
-		re:   `^(?P<root>(?P<repo>([a-z0-9.\-]+\.)+[a-z0-9.\-]+(:[0-9]+)?(/~?[A-Za-z0-9_.\-]+)+?)\.(?P<vcs>bzr|git|hg|svn))(/~?[A-Za-z0-9_.\-]+)*$`,
+		re:   `^(?P<root>(?P<repo>([a-z0-9.\-]+\.)+[a-z0-9.\-]+(:[0-9]+)?(/~?[A-Za-z0-9_.\-]+)+?)\.(?P<vcs>bzr|fossil|git|hg|svn))(/~?[A-Za-z0-9_.\-]+)*$`,
 		ping: true,
 	},
 }

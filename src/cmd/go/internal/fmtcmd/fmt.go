@@ -8,6 +8,8 @@ package fmtcmd
 import (
 	"os"
 	"path/filepath"
+	"runtime"
+	"sync"
 
 	"cmd/go/internal/base"
 	"cmd/go/internal/cfg"
@@ -22,10 +24,10 @@ func init() {
 var CmdFmt = &base.Command{
 	Run:       runFmt,
 	UsageLine: "fmt [-n] [-x] [packages]",
-	Short:     "run gofmt on package sources",
+	Short:     "gofmt (reformat) package sources",
 	Long: `
 Fmt runs the command 'gofmt -l -w' on the packages named
-by the import paths.  It prints the names of the files that are modified.
+by the import paths. It prints the names of the files that are modified.
 
 For more about gofmt, see 'go doc cmd/gofmt'.
 For more about specifying packages, see 'go help packages'.
@@ -41,12 +43,29 @@ See also: go fix, go vet.
 
 func runFmt(cmd *base.Command, args []string) {
 	gofmt := gofmtPath()
+	procs := runtime.GOMAXPROCS(0)
+	var wg sync.WaitGroup
+	wg.Add(procs)
+	fileC := make(chan string, 2*procs)
+	for i := 0; i < procs; i++ {
+		go func() {
+			defer wg.Done()
+			for file := range fileC {
+				base.Run(str.StringList(gofmt, "-l", "-w", file))
+			}
+		}()
+	}
 	for _, pkg := range load.Packages(args) {
 		// Use pkg.gofiles instead of pkg.Dir so that
 		// the command only applies to this package,
 		// not to packages in subdirectories.
-		base.Run(str.StringList(gofmt, "-l", "-w", base.RelPaths(pkg.Internal.AllGoFiles)))
+		files := base.RelPaths(pkg.InternalAllGoFiles())
+		for _, file := range files {
+			fileC <- file
+		}
 	}
+	close(fileC)
+	wg.Wait()
 }
 
 func gofmtPath() string {

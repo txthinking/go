@@ -108,7 +108,8 @@ var (
 	IPv6linklocalallrouters    = IP{0xff, 0x02, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x02}
 )
 
-// IsUnspecified reports whether ip is an unspecified address.
+// IsUnspecified reports whether ip is an unspecified address, either
+// the IPv4 address "0.0.0.0" or the IPv6 address "::".
 func (ip IP) IsUnspecified() bool {
 	return ip.Equal(IPv4zero) || ip.Equal(IPv6unspecified)
 }
@@ -662,7 +663,7 @@ func ParseIP(s string) IP {
 // It returns the IP address and the network implied by the IP and
 // prefix length.
 // For example, ParseCIDR("192.0.2.1/24") returns the IP address
-// 198.0.2.1 and the network 198.0.2.0/24.
+// 192.0.2.1 and the network 192.0.2.0/24.
 func ParseCIDR(s string) (IP, *IPNet, error) {
 	i := byteIndex(s, '/')
 	if i < 0 {

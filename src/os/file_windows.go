@@ -54,7 +54,7 @@ func newFile(h syscall.Handle, name string, kind string) *File {
 
 	// Ignore initialization errors.
 	// Assume any problems will show up in later I/O.
-	f.pfd.Init(kind)
+	f.pfd.Init(kind, false)
 
 	return f
 }
@@ -64,7 +64,9 @@ func newConsoleFile(h syscall.Handle, name string) *File {
 	return newFile(h, name, "console")
 }
 
-// NewFile returns a new File with the given file descriptor and name.
+// NewFile returns a new File with the given file descriptor and
+// name. The returned value will be nil if fd is not a valid file
+// descriptor.
 func NewFile(fd uintptr, name string) *File {
 	h := syscall.Handle(fd)
 	if h == syscall.InvalidHandle {
@@ -179,7 +181,7 @@ func (file *File) Close() error {
 }
 
 func (file *file) close() error {
-	if file == nil || file.pfd.Sysfd == badFd {
+	if file == nil {
 		return syscall.EINVAL
 	}
 	if file.isdir() && file.dirinfo.isempty {
@@ -188,9 +190,11 @@ func (file *file) close() error {
 	}
 	var err error
 	if e := file.pfd.Close(); e != nil {
+		if e == poll.ErrFileClosing {
+			e = ErrClosed
+		}
 		err = &PathError{"close", file.name, e}
 	}
-	file.pfd.Sysfd = badFd // so it can't be closed again
 
 	// no need for a finalizer anymore
 	runtime.SetFinalizer(file, nil)
@@ -306,23 +310,14 @@ func rename(oldname, newname string) error {
 // It returns the files and an error, if any.
 func Pipe() (r *File, w *File, err error) {
 	var p [2]syscall.Handle
-
-	// See ../syscall/exec.go for description of lock.
-	syscall.ForkLock.RLock()
-	e := syscall.Pipe(p[0:])
+	e := syscall.CreatePipe(&p[0], &p[1], nil, 0)
 	if e != nil {
-		syscall.ForkLock.RUnlock()
 		return nil, nil, NewSyscallError("pipe", e)
 	}
-	syscall.CloseOnExec(p[0])
-	syscall.CloseOnExec(p[1])
-	syscall.ForkLock.RUnlock()
-
 	return newFile(p[0], "|0", "file"), newFile(p[1], "|1", "file"), nil
 }
 
-// TempDir returns the default directory to use for temporary files.
-func TempDir() string {
+func tempDir() string {
 	n := uint32(syscall.MAX_PATH)
 	for {
 		b := make([]uint16, n)
@@ -394,5 +389,3 @@ func Symlink(oldname, newname string) error {
 	}
 	return nil
 }
-
-const badFd = syscall.InvalidHandle

@@ -85,14 +85,14 @@ nocgo:
 	// start this M
 	BL	runtime·mstart(SB)
 
-	MOVD	R0, 1(R0)
+	MOVD	R0, 0(R0)
 	RET
 
 DATA	runtime·mainPC+0(SB)/8,$runtime·main(SB)
 GLOBL	runtime·mainPC(SB),RODATA,$8
 
 TEXT runtime·breakpoint(SB),NOSPLIT|NOFRAME,$0-0
-	MOVD	R0, 2(R0) // TODO: TD
+	MOVD	R0, 0(R0) // TODO: TD
 	RET
 
 TEXT runtime·asminit(SB),NOSPLIT|NOFRAME,$0-0
@@ -133,18 +133,6 @@ TEXT runtime·gosave(SB), NOSPLIT|NOFRAME, $0-8
 // restore state from Gobuf; longjmp
 TEXT runtime·gogo(SB), NOSPLIT, $16-8
 	MOVD	buf+0(FP), R5
-
-	// If ctxt is not nil, invoke deletion barrier before overwriting.
-	MOVD	gobuf_ctxt(R5), R3
-	CMP	R0, R3
-	BEQ	nilctxt
-	MOVD	$gobuf_ctxt(R5), R3
-	MOVD	R3, FIXED_FRAME+0(R1)
-	MOVD	R0, FIXED_FRAME+8(R1)
-	BL	runtime·writebarrierptr_prewrite(SB)
-	MOVD	buf+0(FP), R5
-
-nilctxt:
 	MOVD	gobuf_g(R5), g	// make sure g is not nil
 	BL	runtime·save_g(SB)
 
@@ -277,6 +265,9 @@ switch:
 
 noswitch:
 	// already on m stack, just call directly
+	// On other arches we do a tail call here, but it appears to be
+	// impossible to tail call a function pointer in shared mode on
+	// ppc64 because the caller is responsible for restoring the TOC.
 	MOVD	0(R11), R12	// code pointer
 	MOVD	R12, CTR
 	BL	(CTR)
@@ -317,7 +308,7 @@ TEXT runtime·morestack(SB),NOSPLIT|NOFRAME,$0-0
 	MOVD	LR, R8
 	MOVD	R8, (g_sched+gobuf_pc)(g)
 	MOVD	R5, (g_sched+gobuf_lr)(g)
-	// newstack will fill gobuf.ctxt.
+	MOVD	R11, (g_sched+gobuf_ctxt)(g)
 
 	// Called from f.
 	// Set m->morebuf to f's caller.
@@ -329,8 +320,7 @@ TEXT runtime·morestack(SB),NOSPLIT|NOFRAME,$0-0
 	MOVD	m_g0(R7), g
 	BL	runtime·save_g(SB)
 	MOVD	(g_sched+gobuf_sp)(g), R1
-	MOVDU   R0, -(FIXED_FRAME+8)(R1)	// create a call frame on g0
-	MOVD	R11, FIXED_FRAME+0(R1)	// ctxt argument
+	MOVDU   R0, -(FIXED_FRAME+0)(R1)	// create a call frame on g0
 	BL	runtime·newstack(SB)
 
 	// Not reached, but make sure the return PC from the call to newstack
@@ -714,9 +704,9 @@ TEXT setg_gcc<>(SB),NOSPLIT|NOFRAME,$0-0
 	MOVD	R4, LR
 	RET
 
-TEXT runtime·getcallerpc(SB),NOSPLIT,$8-16
-	MOVD	FIXED_FRAME+8(R1), R3		// LR saved by caller
-	MOVD	R3, ret+8(FP)
+TEXT runtime·getcallerpc(SB),NOSPLIT|NOFRAME,$0-8
+	MOVD	0(R1), R3		// LR saved by caller
+	MOVD	R3, ret+0(FP)
 	RET
 
 TEXT runtime·abort(SB),NOSPLIT|NOFRAME,$0-0
@@ -736,23 +726,6 @@ TEXT runtime·cputicks(SB),NOSPLIT,$0-8
 	SLD	$32, R5
 	OR	R5, R3
 	MOVD	R3, ret+0(FP)
-	RET
-
-// memhash_varlen(p unsafe.Pointer, h seed) uintptr
-// redirects to memhash(p, h, size) using the size
-// stored in the closure.
-TEXT runtime·memhash_varlen(SB),NOSPLIT,$40-24
-	GO_ARGS
-	NO_LOCAL_POINTERS
-	MOVD	p+0(FP), R3
-	MOVD	h+8(FP), R4
-	MOVD	8(R11), R5
-	MOVD	R3, FIXED_FRAME+0(R1)
-	MOVD	R4, FIXED_FRAME+8(R1)
-	MOVD	R5, FIXED_FRAME+16(R1)
-	BL	runtime·memhash(SB)
-	MOVD	FIXED_FRAME+24(R1), R3
-	MOVD	R3, ret+16(FP)
 	RET
 
 // AES hashing not implemented for ppc64
@@ -1074,24 +1047,6 @@ equal:
 	MOVD    $1, R9
 	RET
 
-// eqstring tests whether two strings are equal.
-// The compiler guarantees that strings passed
-// to eqstring have equal length.
-// See runtime_test.go:eqstring_generic for
-// equivalent Go code.
-TEXT runtime·eqstring(SB),NOSPLIT,$0-33
-	MOVD    s1_base+0(FP), R3
-	MOVD    s2_base+16(FP), R4
-	MOVD    $1, R5
-	MOVB    R5, ret+32(FP)
-	CMP     R3, R4
-	BNE     2(PC)
-	RET
-	MOVD    s1_len+8(FP), R5
-	BL      runtime·memeqbody(SB)
-	MOVB    R9, ret+32(FP)
-	RET
-
 TEXT bytes·Equal(SB),NOSPLIT,$0-49
 	MOVD	a_len+8(FP), R4
 	MOVD	b_len+32(FP), R5
@@ -1293,27 +1248,64 @@ small_string:
 
 TEXT runtime·cmpstring(SB),NOSPLIT|NOFRAME,$0-40
 	MOVD	s1_base+0(FP), R5
-	MOVD	s1_len+8(FP), R3
 	MOVD	s2_base+16(FP), R6
+	MOVD	s1_len+8(FP), R3
+	CMP	R5,R6,CR7
 	MOVD	s2_len+24(FP), R4
 	MOVD	$ret+32(FP), R7
+	CMP	R3,R4,CR6
+	BEQ	CR7,equal
+
+notequal:
 #ifdef	GOARCH_ppc64le
 	BR	cmpbodyLE<>(SB)
 #else
 	BR      cmpbodyBE<>(SB)
 #endif
 
+equal:
+	BEQ	CR6,done
+	MOVD	$1, R8
+	BGT	CR6,greater
+	NEG	R8
+
+greater:
+	MOVD	R8, (R7)
+	RET
+
+done:
+	MOVD	$0, (R7)
+	RET
+
 TEXT bytes·Compare(SB),NOSPLIT|NOFRAME,$0-56
 	MOVD	s1+0(FP), R5
-	MOVD	s1+8(FP), R3
 	MOVD	s2+24(FP), R6
+	MOVD	s1+8(FP), R3
+	CMP	R5,R6,CR7
 	MOVD	s2+32(FP), R4
 	MOVD	$ret+48(FP), R7
+	CMP	R3,R4,CR6
+	BEQ	CR7,equal
+
 #ifdef	GOARCH_ppc64le
 	BR	cmpbodyLE<>(SB)
 #else
 	BR      cmpbodyBE<>(SB)
 #endif
+
+equal:
+	BEQ	CR6,done
+	MOVD	$1, R8
+	BGT	CR6,greater
+	NEG	R8
+
+greater:
+	MOVD	R8, (R7)
+	RET
+
+done:
+	MOVD	$0, (R7)
+	RET
 
 TEXT runtime·return0(SB), NOSPLIT, $0
 	MOVW	$0, R3
@@ -1352,18 +1344,6 @@ TEXT runtime·goexit(SB),NOSPLIT|NOFRAME,$0-0
 	BL	runtime·goexit1(SB)	// does not return
 	// traceback from goexit1 must hit code range of goexit
 	MOVD	R0, R0	// NOP
-
-TEXT runtime·prefetcht0(SB),NOSPLIT,$0-8
-	RET
-
-TEXT runtime·prefetcht1(SB),NOSPLIT,$0-8
-	RET
-
-TEXT runtime·prefetcht2(SB),NOSPLIT,$0-8
-	RET
-
-TEXT runtime·prefetchnta(SB),NOSPLIT,$0-8
-	RET
 
 TEXT runtime·sigreturn(SB),NOSPLIT,$0-0
 	RET

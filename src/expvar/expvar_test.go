@@ -21,9 +21,11 @@ import (
 // RemoveAll removes all exported variables.
 // This is for tests only.
 func RemoveAll() {
-	mutex.Lock()
-	defer mutex.Unlock()
-	vars = make(map[string]Var)
+	varKeysMu.Lock()
+	defer varKeysMu.Unlock()
+	for _, k := range varKeys {
+		vars.Delete(k)
+	}
 	varKeys = nil
 }
 
@@ -130,22 +132,22 @@ func BenchmarkFloatSet(b *testing.B) {
 func TestString(t *testing.T) {
 	RemoveAll()
 	name := NewString("my-name")
-	if name.Value() != "" {
-		t.Errorf("name.Value() = %q, want \"\"", name.s)
+	if s := name.Value(); s != "" {
+		t.Errorf(`NewString("my-name").Value() = %q, want ""`, s)
 	}
 
 	name.Set("Mike")
 	if s, want := name.String(), `"Mike"`; s != want {
-		t.Errorf("from %q, name.String() = %q, want %q", name.s, s, want)
+		t.Errorf(`after name.Set("Mike"), name.String() = %q, want %q`, s, want)
 	}
 	if s, want := name.Value(), "Mike"; s != want {
-		t.Errorf("from %q, name.Value() = %q, want %q", name.s, s, want)
+		t.Errorf(`after name.Set("Mike"), name.Value() = %q, want %q`, s, want)
 	}
 
 	// Make sure we produce safe JSON output.
-	name.Set(`<`)
+	name.Set("<")
 	if s, want := name.String(), "\"\\u003c\""; s != want {
-		t.Errorf("from %q, name.String() = %q, want %q", name.s, s, want)
+		t.Errorf(`after name.Set("<"), name.String() = %q, want %q`, s, want)
 	}
 }
 
@@ -157,6 +159,28 @@ func BenchmarkStringSet(b *testing.B) {
 			s.Set("red")
 		}
 	})
+}
+
+func TestMapInit(t *testing.T) {
+	RemoveAll()
+	colors := NewMap("bike-shed-colors")
+	colors.Add("red", 1)
+	colors.Add("blue", 1)
+	colors.Add("chartreuse", 1)
+
+	n := 0
+	colors.Do(func(KeyValue) { n++ })
+	if n != 3 {
+		t.Errorf("after three Add calls with distinct keys, Do should invoke f 3 times; got %v", n)
+	}
+
+	colors.Init()
+
+	n = 0
+	colors.Do(func(KeyValue) { n++ })
+	if n != 0 {
+		t.Errorf("after Init, Do should invoke f 0 times; got %v", n)
+	}
 }
 
 func TestMapCounter(t *testing.T) {

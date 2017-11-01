@@ -59,6 +59,10 @@ type printableStringTest struct {
 	A string `asn1:"printable"`
 }
 
+type genericStringTest struct {
+	A string
+}
+
 type optionalRawValueTest struct {
 	A RawValue `asn1:"optional"`
 }
@@ -69,6 +73,11 @@ type omitEmptyTest struct {
 
 type defaultTest struct {
 	A int `asn1:"optional,default:1"`
+}
+
+type applicationTest struct {
+	A int `asn1:"application,tag:0"`
+	B int `asn1:"application,tag:1,explicit"`
 }
 
 type testSET []int
@@ -142,6 +151,8 @@ var marshalTests = []marshalTest{
 	{optionalRawValueTest{}, "3000"},
 	{printableStringTest{"test"}, "3006130474657374"},
 	{printableStringTest{"test*"}, "30071305746573742a"},
+	{genericStringTest{"test"}, "3006130474657374"},
+	{genericStringTest{"test*"}, "30070c05746573742a"},
 	{rawContentsStruct{nil, 64}, "3003020140"},
 	{rawContentsStruct{[]byte{0x30, 3, 1, 2, 3}, 64}, "3003010203"},
 	{RawValue{Tag: 1, Class: 2, IsCompound: false, Bytes: []byte{1, 2, 3}}, "8103010203"},
@@ -152,6 +163,7 @@ var marshalTests = []marshalTest{
 	{defaultTest{0}, "3003020100"},
 	{defaultTest{1}, "3000"},
 	{defaultTest{2}, "3003020102"},
+	{applicationTest{1, 2}, "30084001016103020102"},
 }
 
 func TestMarshal(t *testing.T) {

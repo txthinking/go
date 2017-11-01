@@ -36,7 +36,7 @@
 #define SYS_gettid (SYS_BASE + 224)
 #define SYS_tkill (SYS_BASE + 238)
 #define SYS_sched_yield (SYS_BASE + 158)
-#define SYS_select (SYS_BASE + 142) // newselect
+#define SYS_pselect6 (SYS_BASE + 335)
 #define SYS_ugetrlimit (SYS_BASE + 191)
 #define SYS_sched_getaffinity (SYS_BASE + 242)
 #define SYS_clock_gettime (SYS_BASE + 263)
@@ -48,6 +48,7 @@
 #define SYS_access (SYS_BASE + 33)
 #define SYS_connect (SYS_BASE + 283)
 #define SYS_socket (SYS_BASE + 281)
+#define SYS_brk (SYS_BASE + 45)
 
 #define ARM_BASE (SYS_BASE + 0x0f0000)
 
@@ -113,13 +114,29 @@ TEXT runtime·exit(SB),NOSPLIT,$-4
 	MOVW	$1002, R1
 	MOVW	R0, (R1)	// fail hard
 
-TEXT runtime·exit1(SB),NOSPLIT,$-4
+TEXT exit1<>(SB),NOSPLIT,$-4
 	MOVW	code+0(FP), R0
 	MOVW	$SYS_exit, R7
 	SWI	$0
 	MOVW	$1234, R0
 	MOVW	$1003, R1
 	MOVW	R0, (R1)	// fail hard
+
+// func exitThread(wait *uint32)
+TEXT runtime·exitThread(SB),NOSPLIT,$-4-4
+	MOVW	wait+0(FP), R0
+	// We're done using the stack.
+	// Alas, there's no reliable way to make this write atomic
+	// without potentially using the stack. So it goes.
+	MOVW	$0, R1
+	MOVW	R1, (R0)
+	MOVW	$0, R0	// exit code
+	MOVW	$SYS_exit, R7
+	SWI	$0
+	MOVW	$1234, R0
+	MOVW	$1004, R1
+	MOVW	R0, (R1)	// fail hard
+	JMP	0(PC)
 
 TEXT runtime·gettid(SB),NOSPLIT,$0-4
 	MOVW	$SYS_gettid, R7
@@ -156,8 +173,12 @@ TEXT runtime·mmap(SB),NOSPLIT,$0
 	SWI	$0
 	MOVW	$0xfffff001, R6
 	CMP		R6, R0
+	MOVW	$0, R1
 	RSB.HI	$0, R0
-	MOVW	R0, ret+24(FP)
+	MOVW.HI	R0, R1		// if error, put in R1
+	MOVW.HI	$0, R0
+	MOVW	R0, p+24(FP)
+	MOVW	R1, err+28(FP)
 	RET
 
 TEXT runtime·munmap(SB),NOSPLIT,$0
@@ -316,7 +337,7 @@ nog:
 	SUB	$16, R13 // restore the stack pointer to avoid memory corruption
 	MOVW	$0, R0
 	MOVW	R0, 4(R13)
-	BL	runtime·exit1(SB)
+	BL	exit1<>(SB)
 
 	MOVW	$1234, R0
 	MOVW	$1005, R1
@@ -387,13 +408,16 @@ TEXT runtime·usleep(SB),NOSPLIT,$12
 	MOVW	usec+0(FP), R0
 	CALL	runtime·usplitR0(SB)
 	MOVW	R0, 4(R13)
+	MOVW	$1000, R0	// usec to nsec
+	MUL	R0, R1
 	MOVW	R1, 8(R13)
 	MOVW	$0, R0
 	MOVW	$0, R1
 	MOVW	$0, R2
 	MOVW	$0, R3
 	MOVW	$4(R13), R4
-	MOVW	$SYS_select, R7
+	MOVW	$0, R5
+	MOVW	$SYS_pselect6, R7
 	SWI	$0
 	RET
 
@@ -503,4 +527,13 @@ TEXT runtime·socket(SB),NOSPLIT,$0
 	MOVW	$SYS_socket, R7
 	SWI	$0
 	MOVW	R0, ret+12(FP)
+	RET
+
+// func sbrk0() uintptr
+TEXT runtime·sbrk0(SB),NOSPLIT,$0-4
+	// Implemented as brk(NULL).
+	MOVW	$0, R0
+	MOVW	$SYS_brk, R7
+	SWI	$0
+	MOVW	R0, ret+0(FP)
 	RET

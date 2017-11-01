@@ -329,6 +329,16 @@ func (r *Request) WithContext(ctx context.Context) *Request {
 	r2 := new(Request)
 	*r2 = *r
 	r2.ctx = ctx
+
+	// Deep copy the URL because it isn't
+	// a map and the URL is mutable by users
+	// of WithContext.
+	if r.URL != nil {
+		r2URL := new(url.URL)
+		*r2URL = *r.URL
+		r2.URL = r2URL
+	}
+
 	return r2
 }
 
@@ -337,18 +347,6 @@ func (r *Request) WithContext(ctx context.Context) *Request {
 func (r *Request) ProtoAtLeast(major, minor int) bool {
 	return r.ProtoMajor > major ||
 		r.ProtoMajor == major && r.ProtoMinor >= minor
-}
-
-// protoAtLeastOutgoing is like ProtoAtLeast, but is for outgoing
-// requests (see issue 18407) where these fields aren't supposed to
-// matter.  As a minor fix for Go 1.8, at least treat (0, 0) as
-// matching HTTP/1.1 or HTTP/1.0.  Only HTTP/1.1 is used.
-// TODO(bradfitz): ideally remove this whole method. It shouldn't be used.
-func (r *Request) protoAtLeastOutgoing(major, minor int) bool {
-	if r.ProtoMajor == 0 && r.ProtoMinor == 0 && major == 1 && minor <= 1 {
-		return true
-	}
-	return r.ProtoAtLeast(major, minor)
 }
 
 // UserAgent returns the client's User-Agent, if sent in the request.
@@ -492,8 +490,8 @@ var errMissingHost = errors.New("http: Request.Write on Request with no Host or 
 
 // extraHeaders may be nil
 // waitForContinue may be nil
-func (req *Request) write(w io.Writer, usingProxy bool, extraHeaders Header, waitForContinue func() bool) (err error) {
-	trace := httptrace.ContextClientTrace(req.Context())
+func (r *Request) write(w io.Writer, usingProxy bool, extraHeaders Header, waitForContinue func() bool) (err error) {
+	trace := httptrace.ContextClientTrace(r.Context())
 	if trace != nil && trace.WroteRequest != nil {
 		defer func() {
 			trace.WroteRequest(httptrace.WroteRequestInfo{
@@ -506,12 +504,12 @@ func (req *Request) write(w io.Writer, usingProxy bool, extraHeaders Header, wai
 	// is not given, use the host from the request URL.
 	//
 	// Clean the host, in case it arrives with unexpected stuff in it.
-	host := cleanHost(req.Host)
+	host := cleanHost(r.Host)
 	if host == "" {
-		if req.URL == nil {
+		if r.URL == nil {
 			return errMissingHost
 		}
-		host = cleanHost(req.URL.Host)
+		host = cleanHost(r.URL.Host)
 	}
 
 	// According to RFC 6874, an HTTP client, proxy, or other
@@ -519,10 +517,10 @@ func (req *Request) write(w io.Writer, usingProxy bool, extraHeaders Header, wai
 	// to an outgoing URI.
 	host = removeZone(host)
 
-	ruri := req.URL.RequestURI()
-	if usingProxy && req.URL.Scheme != "" && req.URL.Opaque == "" {
-		ruri = req.URL.Scheme + "://" + host + ruri
-	} else if req.Method == "CONNECT" && req.URL.Path == "" {
+	ruri := r.URL.RequestURI()
+	if usingProxy && r.URL.Scheme != "" && r.URL.Opaque == "" {
+		ruri = r.URL.Scheme + "://" + host + ruri
+	} else if r.Method == "CONNECT" && r.URL.Path == "" {
 		// CONNECT requests normally give just the host and port, not a full URL.
 		ruri = host
 	}
@@ -538,7 +536,7 @@ func (req *Request) write(w io.Writer, usingProxy bool, extraHeaders Header, wai
 		w = bw
 	}
 
-	_, err = fmt.Fprintf(w, "%s %s HTTP/1.1\r\n", valueOrDefault(req.Method, "GET"), ruri)
+	_, err = fmt.Fprintf(w, "%s %s HTTP/1.1\r\n", valueOrDefault(r.Method, "GET"), ruri)
 	if err != nil {
 		return err
 	}
@@ -552,8 +550,8 @@ func (req *Request) write(w io.Writer, usingProxy bool, extraHeaders Header, wai
 	// Use the defaultUserAgent unless the Header contains one, which
 	// may be blank to not send the header.
 	userAgent := defaultUserAgent
-	if _, ok := req.Header["User-Agent"]; ok {
-		userAgent = req.Header.Get("User-Agent")
+	if _, ok := r.Header["User-Agent"]; ok {
+		userAgent = r.Header.Get("User-Agent")
 	}
 	if userAgent != "" {
 		_, err = fmt.Fprintf(w, "User-Agent: %s\r\n", userAgent)
@@ -563,7 +561,7 @@ func (req *Request) write(w io.Writer, usingProxy bool, extraHeaders Header, wai
 	}
 
 	// Process Body,ContentLength,Close,Trailer
-	tw, err := newTransferWriter(req)
+	tw, err := newTransferWriter(r)
 	if err != nil {
 		return err
 	}
@@ -572,7 +570,7 @@ func (req *Request) write(w io.Writer, usingProxy bool, extraHeaders Header, wai
 		return err
 	}
 
-	err = req.Header.WriteSubset(w, reqWriteExcludeHeader)
+	err = r.Header.WriteSubset(w, reqWriteExcludeHeader)
 	if err != nil {
 		return err
 	}
@@ -605,7 +603,7 @@ func (req *Request) write(w io.Writer, usingProxy bool, extraHeaders Header, wai
 			trace.Wait100Continue()
 		}
 		if !waitForContinue() {
-			req.closeBody()
+			r.closeBody()
 			return nil
 		}
 	}
@@ -639,7 +637,7 @@ type requestBodyReadError struct{ error }
 func idnaASCII(v string) (string, error) {
 	// TODO: Consider removing this check after verifying performance is okay.
 	// Right now punycode verification, length checks, context checks, and the
-	// permissable character tests are all omitted. It also prevents the ToASCII
+	// permissible character tests are all omitted. It also prevents the ToASCII
 	// call from salvaging an invalid IDN, when possible. As a result it may be
 	// possible to have two IDNs that appear identical to the user where the
 	// ASCII-only version causes an error downstream whereas the non-ASCII
@@ -764,7 +762,7 @@ func validMethod(method string) bool {
 // exact value (instead of -1), GetBody is populated (so 307 and 308
 // redirects can replay the body), and Body is set to NoBody if the
 // ContentLength is 0.
-func NewRequest(method, urlStr string, body io.Reader) (*Request, error) {
+func NewRequest(method, url string, body io.Reader) (*Request, error) {
 	if method == "" {
 		// We document that "" means "GET" for Request.Method, and people have
 		// relied on that from NewRequest, so keep that working.
@@ -774,7 +772,7 @@ func NewRequest(method, urlStr string, body io.Reader) (*Request, error) {
 	if !validMethod(method) {
 		return nil, fmt.Errorf("net/http: invalid method %q", method)
 	}
-	u, err := url.Parse(urlStr)
+	u, err := parseURL(url) // Just url.Parse (url is shadowed for godoc).
 	if err != nil {
 		return nil, err
 	}
@@ -1031,11 +1029,6 @@ type maxBytesReader struct {
 	r   io.ReadCloser // underlying reader
 	n   int64         // max bytes remaining
 	err error         // sticky error
-}
-
-func (l *maxBytesReader) tooLarge() (n int, err error) {
-	l.err = errors.New("http: request body too large")
-	return 0, l.err
 }
 
 func (l *maxBytesReader) Read(p []byte) (n int, err error) {
@@ -1309,7 +1302,7 @@ func (r *Request) closeBody() {
 }
 
 func (r *Request) isReplayable() bool {
-	if r.Body == nil {
+	if r.Body == nil || r.Body == NoBody || r.GetBody != nil {
 		switch valueOrDefault(r.Method, "GET") {
 		case "GET", "HEAD", "OPTIONS", "TRACE":
 			return true

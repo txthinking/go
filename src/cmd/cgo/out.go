@@ -110,7 +110,13 @@ func (p *Package) writeDefs() {
 		// Which is not useful. Moreover we never override source info,
 		// so subsequent source code uses the same source info.
 		// Moreover, empty file name makes compile emit no source debug info at all.
-		noSourceConf.Fprint(fgo2, fset, def.Go)
+		var buf bytes.Buffer
+		noSourceConf.Fprint(&buf, fset, def.Go)
+		if bytes.HasPrefix(buf.Bytes(), []byte("_Ctype_")) {
+			// This typedef is of the form `typedef a b` and should be an alias.
+			fmt.Fprintf(fgo2, "= ")
+		}
+		fmt.Fprintf(fgo2, "%s", buf.Bytes())
 		fmt.Fprintf(fgo2, "\n\n")
 	}
 	if *gccgo {
@@ -185,7 +191,7 @@ func (p *Package) writeDefs() {
 	for _, key := range nameKeys(p.Name) {
 		n := p.Name[key]
 		if n.Const != "" {
-			fmt.Fprintf(fgo2, "const _Cconst_%s = %s\n", n.Go, n.Const)
+			fmt.Fprintf(fgo2, "const %s = %s\n", n.Mangle, n.Const)
 		}
 	}
 	fmt.Fprintf(fgo2, "\n")
@@ -400,10 +406,12 @@ func (p *Package) writeDefsFunc(fgo2 io.Writer, n *Name, callsMalloc *bool) {
 	inProlog := builtinDefs[name] != ""
 	cname := fmt.Sprintf("_cgo%s%s", cPrefix, n.Mangle)
 	paramnames := []string(nil)
-	for i, param := range d.Type.Params.List {
-		paramName := fmt.Sprintf("p%d", i)
-		param.Names = []*ast.Ident{ast.NewIdent(paramName)}
-		paramnames = append(paramnames, paramName)
+	if d.Type.Params != nil {
+		for i, param := range d.Type.Params.List {
+			paramName := fmt.Sprintf("p%d", i)
+			param.Names = []*ast.Ident{ast.NewIdent(paramName)}
+			paramnames = append(paramnames, paramName)
+		}
 	}
 
 	if *gccgo {
@@ -502,8 +510,10 @@ func (p *Package) writeDefsFunc(fgo2 io.Writer, n *Name, callsMalloc *bool) {
 		fmt.Fprintf(fgo2, "\tif errno != 0 { r2 = syscall.Errno(errno) }\n")
 	}
 	fmt.Fprintf(fgo2, "\tif _Cgo_always_false {\n")
-	for i := range d.Type.Params.List {
-		fmt.Fprintf(fgo2, "\t\t_Cgo_use(p%d)\n", i)
+	if d.Type.Params != nil {
+		for i := range d.Type.Params.List {
+			fmt.Fprintf(fgo2, "\t\t_Cgo_use(p%d)\n", i)
+		}
 	}
 	fmt.Fprintf(fgo2, "\t}\n")
 	fmt.Fprintf(fgo2, "\treturn\n")
@@ -615,14 +625,18 @@ func (p *Package) writeOutputFunc(fgcc *os.File, n *Name) {
 			fmt.Fprint(fgcc, "(__typeof__(a->r)) ")
 		}
 	}
-	fmt.Fprintf(fgcc, "%s(", n.C)
-	for i := range n.FuncType.Params {
-		if i > 0 {
-			fmt.Fprintf(fgcc, ", ")
+	if n.Kind == "macro" {
+		fmt.Fprintf(fgcc, "%s;\n", n.C)
+	} else {
+		fmt.Fprintf(fgcc, "%s(", n.C)
+		for i := range n.FuncType.Params {
+			if i > 0 {
+				fmt.Fprintf(fgcc, ", ")
+			}
+			fmt.Fprintf(fgcc, "a->p%d", i)
 		}
-		fmt.Fprintf(fgcc, "a->p%d", i)
+		fmt.Fprintf(fgcc, ");\n")
 	}
-	fmt.Fprintf(fgcc, ");\n")
 	if n.AddError {
 		fmt.Fprintf(fgcc, "\t_cgo_errno = errno;\n")
 	}
@@ -985,7 +999,7 @@ func (p *Package) writeGccgoExports(fgo2, fm, fgcc, fgcch io.Writer) {
 		default:
 			// Declare a result struct.
 			fmt.Fprintf(fgcch, "\n/* Return type for %s */\n", exp.ExpName)
-			fmt.Fprintf(fgcch, "struct %s_result {\n", exp.ExpName)
+			fmt.Fprintf(fgcch, "struct %s_return {\n", exp.ExpName)
 			forFieldList(fntype.Results,
 				func(i int, aname string, atype ast.Expr) {
 					t := p.cgoType(atype)
@@ -996,7 +1010,7 @@ func (p *Package) writeGccgoExports(fgo2, fm, fgcc, fgcch io.Writer) {
 					fmt.Fprint(fgcch, "\n")
 				})
 			fmt.Fprintf(fgcch, "};\n")
-			fmt.Fprintf(cdeclBuf, "struct %s_result", exp.ExpName)
+			fmt.Fprintf(cdeclBuf, "struct %s_return", exp.ExpName)
 		}
 
 		cRet := cdeclBuf.String()
@@ -1022,7 +1036,7 @@ func (p *Package) writeGccgoExports(fgo2, fm, fgcc, fgcch io.Writer) {
 			fmt.Fprintf(fgcch, "\n%s", exp.Doc)
 		}
 
-		fmt.Fprintf(fgcch, "extern %s %s %s;\n", cRet, exp.ExpName, cParams)
+		fmt.Fprintf(fgcch, "extern %s %s%s;\n", cRet, exp.ExpName, cParams)
 
 		// We need to use a name that will be exported by the
 		// Go code; otherwise gccgo will make it static and we
@@ -1223,8 +1237,9 @@ func (p *Package) cgoType(e ast.Expr) *Type {
 			// Slice: pointer, len, cap.
 			return &Type{Size: p.PtrSize * 3, Align: p.PtrSize, C: c("GoSlice")}
 		}
+		// Non-slice array types are not supported.
 	case *ast.StructType:
-		// TODO
+		// Not supported.
 	case *ast.FuncType:
 		return &Type{Size: p.PtrSize, Align: p.PtrSize, C: c("void*")}
 	case *ast.InterfaceType:
@@ -1298,7 +1313,7 @@ const gccProlog = `
 */
 #define __cgo_compile_assert_eq(x, y, name) typedef char name[(x-y)*(x-y)*-2+1];
 
-// Check at compile time that the sizes we use match our expectations.
+/* Check at compile time that the sizes we use match our expectations. */
 #define __cgo_size_assert(t, n) __cgo_compile_assert_eq(sizeof(t), n, _cgo_sizeof_##t##_is_not_##n)
 
 __cgo_size_assert(char, 1)
@@ -1323,6 +1338,27 @@ const noTsanProlog = `
 `
 
 // This must match the TSAN code in runtime/cgo/libcgo.h.
+// This is used when the code is built with the C/C++ Thread SANitizer,
+// which is not the same as the Go race detector.
+// __tsan_acquire tells TSAN that we are acquiring a lock on a variable,
+// in this case _cgo_sync. __tsan_release releases the lock.
+// (There is no actual lock, we are just telling TSAN that there is.)
+//
+// When we call from Go to C we call _cgo_tsan_acquire.
+// When the C function returns we call _cgo_tsan_release.
+// Similarly, when C calls back into Go we call _cgo_tsan_release
+// and then call _cgo_tsan_acquire when we return to C.
+// These calls tell TSAN that there is a serialization point at the C call.
+//
+// This is necessary because TSAN, which is a C/C++ tool, can not see
+// the synchronization in the Go code. Without these calls, when
+// multiple goroutines call into C code, TSAN does not understand
+// that the calls are properly synchronized on the Go side.
+//
+// To be clear, if the calls are not properly synchronized on the Go side,
+// we will be hiding races. But when using TSAN on mixed Go C/C++ code
+// it is more important to avoid false positives, which reduce confidence
+// in the tool, than to avoid false negatives.
 const yesTsanProlog = `
 #line 1 "cgo-tsan-prolog"
 #define CGO_NO_SANITIZE_THREAD __attribute__ ((no_sanitize_thread))

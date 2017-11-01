@@ -25,13 +25,6 @@ import (
 	"time"
 )
 
-// A dnsDialer provides dialing suitable for DNS queries.
-type dnsDialer interface {
-	dialDNS(ctx context.Context, network, addr string) (dnsConn, error)
-}
-
-var testHookDNSDialer = func() dnsDialer { return &Dialer{} }
-
 // A dnsConn represents a DNS transport endpoint.
 type dnsConn interface {
 	io.Closer
@@ -43,14 +36,14 @@ type dnsConn interface {
 	dnsRoundTrip(query *dnsMsg) (*dnsMsg, error)
 }
 
-func (c *UDPConn) dnsRoundTrip(query *dnsMsg) (*dnsMsg, error) {
-	return dnsRoundTripUDP(c, query)
+// dnsPacketConn implements the dnsConn interface for RFC 1035's
+// "UDP usage" transport mechanism. Conn is a packet-oriented connection,
+// such as a *UDPConn.
+type dnsPacketConn struct {
+	Conn
 }
 
-// dnsRoundTripUDP implements the dnsRoundTrip interface for RFC 1035's
-// "UDP usage" transport mechanism. c should be a packet-oriented connection,
-// such as a *UDPConn.
-func dnsRoundTripUDP(c io.ReadWriter, query *dnsMsg) (*dnsMsg, error) {
+func (c *dnsPacketConn) dnsRoundTrip(query *dnsMsg) (*dnsMsg, error) {
 	b, ok := query.Pack()
 	if !ok {
 		return nil, errors.New("cannot marshal DNS message")
@@ -76,14 +69,14 @@ func dnsRoundTripUDP(c io.ReadWriter, query *dnsMsg) (*dnsMsg, error) {
 	}
 }
 
-func (c *TCPConn) dnsRoundTrip(out *dnsMsg) (*dnsMsg, error) {
-	return dnsRoundTripTCP(c, out)
+// dnsStreamConn implements the dnsConn interface for RFC 1035's
+// "TCP usage" transport mechanism. Conn is a stream-oriented connection,
+// such as a *TCPConn.
+type dnsStreamConn struct {
+	Conn
 }
 
-// dnsRoundTripTCP implements the dnsRoundTrip interface for RFC 1035's
-// "TCP usage" transport mechanism. c should be a stream-oriented connection,
-// such as a *TCPConn.
-func dnsRoundTripTCP(c io.ReadWriter, query *dnsMsg) (*dnsMsg, error) {
+func (c *dnsStreamConn) dnsRoundTrip(query *dnsMsg) (*dnsMsg, error) {
 	b, ok := query.Pack()
 	if !ok {
 		return nil, errors.New("cannot marshal DNS message")
@@ -116,33 +109,8 @@ func dnsRoundTripTCP(c io.ReadWriter, query *dnsMsg) (*dnsMsg, error) {
 	return resp, nil
 }
 
-func (d *Dialer) dialDNS(ctx context.Context, network, server string) (dnsConn, error) {
-	switch network {
-	case "tcp", "tcp4", "tcp6", "udp", "udp4", "udp6":
-	default:
-		return nil, UnknownNetworkError(network)
-	}
-	// Calling Dial here is scary -- we have to be sure not to
-	// dial a name that will require a DNS lookup, or Dial will
-	// call back here to translate it. The DNS config parser has
-	// already checked that all the cfg.servers are IP
-	// addresses, which Dial will use without a DNS lookup.
-	c, err := d.DialContext(ctx, network, server)
-	if err != nil {
-		return nil, mapErr(err)
-	}
-	switch network {
-	case "tcp", "tcp4", "tcp6":
-		return c.(*TCPConn), nil
-	case "udp", "udp4", "udp6":
-		return c.(*UDPConn), nil
-	}
-	panic("unreachable")
-}
-
 // exchange sends a query on the connection and hopes for a response.
-func exchange(ctx context.Context, server, name string, qtype uint16, timeout time.Duration) (*dnsMsg, error) {
-	d := testHookDNSDialer()
+func (r *Resolver) exchange(ctx context.Context, server, name string, qtype uint16, timeout time.Duration) (*dnsMsg, error) {
 	out := dnsMsg{
 		dnsMsgHdr: dnsMsgHdr{
 			recursion_desired: true,
@@ -158,7 +126,7 @@ func exchange(ctx context.Context, server, name string, qtype uint16, timeout ti
 		ctx, cancel := context.WithDeadline(ctx, time.Now().Add(timeout))
 		defer cancel()
 
-		c, err := d.dialDNS(ctx, network, server)
+		c, err := r.dial(ctx, network, server)
 		if err != nil {
 			return nil, err
 		}
@@ -181,7 +149,7 @@ func exchange(ctx context.Context, server, name string, qtype uint16, timeout ti
 
 // Do a lookup for a single name, which must be rooted
 // (otherwise answer will not find the answers).
-func tryOneName(ctx context.Context, cfg *dnsConfig, name string, qtype uint16) (string, []dnsRR, error) {
+func (r *Resolver) tryOneName(ctx context.Context, cfg *dnsConfig, name string, qtype uint16) (string, []dnsRR, error) {
 	var lastErr error
 	serverOffset := cfg.serverOffset()
 	sLen := uint32(len(cfg.servers))
@@ -190,7 +158,7 @@ func tryOneName(ctx context.Context, cfg *dnsConfig, name string, qtype uint16) 
 		for j := uint32(0); j < sLen; j++ {
 			server := cfg.servers[(serverOffset+j)%sLen]
 
-			msg, err := exchange(ctx, server, name, qtype, cfg.timeout)
+			msg, err := r.exchange(ctx, server, name, qtype, cfg.timeout)
 			if err != nil {
 				lastErr = &DNSError{
 					Err:    err.Error(),
@@ -333,7 +301,7 @@ func (r *Resolver) lookup(ctx context.Context, name string, qtype uint16) (cname
 	conf := resolvConf.dnsConfig
 	resolvConf.mu.RUnlock()
 	for _, fqdn := range conf.nameList(name) {
-		cname, rrs, err = tryOneName(ctx, conf, fqdn, qtype)
+		cname, rrs, err = r.tryOneName(ctx, conf, fqdn, qtype)
 		if err == nil {
 			break
 		}
@@ -512,7 +480,7 @@ func (r *Resolver) goLookupIPCNAMEOrder(ctx context.Context, name string, order 
 	for _, fqdn := range conf.nameList(name) {
 		for _, qtype := range qtypes {
 			go func(qtype uint16) {
-				cname, rrs, err := tryOneName(ctx, conf, fqdn, qtype)
+				cname, rrs, err := r.tryOneName(ctx, conf, fqdn, qtype)
 				lane <- racer{cname, rrs, err}
 			}(qtype)
 		}

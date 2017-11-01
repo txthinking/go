@@ -28,16 +28,92 @@ TEXT runtime·rt0_go(SB),NOSPLIT,$0
 	MOVL	SP, (g_stack+stack_hi)(DI)
 
 	// find out information about the processor we're on
-	MOVQ	$0, AX
+	MOVL	$0, AX
 	CPUID
-	CMPQ	AX, $0
+	CMPL	AX, $0
 	JE	nocpuinfo
-	MOVQ	$1, AX
+
+	CMPL	BX, $0x756E6547  // "Genu"
+	JNE	notintel
+	CMPL	DX, $0x49656E69  // "ineI"
+	JNE	notintel
+	CMPL	CX, $0x6C65746E  // "ntel"
+	JNE	notintel
+	MOVB	$1, runtime·isIntel(SB)
+notintel:
+
+	// Load EAX=1 cpuid flags
+	MOVL	$1, AX
 	CPUID
-	MOVL	CX, runtime·cpuid_ecx(SB)
-	MOVL	DX, runtime·cpuid_edx(SB)
-nocpuinfo:	
-	
+	MOVL	AX, runtime·processorVersionInfo(SB)
+
+	TESTL	$(1<<26), DX // SSE2
+	SETNE	runtime·support_sse2(SB)
+
+	TESTL	$(1<<9), CX // SSSE3
+	SETNE	runtime·support_ssse3(SB)
+
+	TESTL	$(1<<19), CX // SSE4.1
+	SETNE	runtime·support_sse41(SB)
+
+	TESTL	$(1<<20), CX // SSE4.2
+	SETNE	runtime·support_sse42(SB)
+
+	TESTL	$(1<<23), CX // POPCNT
+	SETNE	runtime·support_popcnt(SB)
+
+	TESTL	$(1<<25), CX // AES
+	SETNE	runtime·support_aes(SB)
+
+	TESTL	$(1<<27), CX // OSXSAVE
+	SETNE	runtime·support_osxsave(SB)
+
+	// If OS support for XMM and YMM is not present
+	// support_avx will be set back to false later.
+	TESTL	$(1<<28), CX // AVX
+	SETNE	runtime·support_avx(SB)
+
+eax7:
+	// Load EAX=7/ECX=0 cpuid flags
+	CMPL	SI, $7
+	JLT	osavx
+	MOVL	$7, AX
+	MOVL	$0, CX
+	CPUID
+
+	TESTL	$(1<<3), BX // BMI1
+	SETNE	runtime·support_bmi1(SB)
+
+	// If OS support for XMM and YMM is not present
+	// support_avx2 will be set back to false later.
+	TESTL	$(1<<5), BX
+	SETNE	runtime·support_avx2(SB)
+
+	TESTL	$(1<<8), BX // BMI2
+	SETNE	runtime·support_bmi2(SB)
+
+	TESTL	$(1<<9), BX // ERMS
+	SETNE	runtime·support_erms(SB)
+
+osavx:
+	// nacl does not support XGETBV to test
+	// for XMM and YMM OS support.
+#ifndef GOOS_nacl
+	CMPB	runtime·support_osxsave(SB), $1
+	JNE	noavx
+	MOVL	$0, CX
+	// For XGETBV, OSXSAVE bit is required and sufficient
+	XGETBV
+	ANDL	$6, AX
+	CMPL	AX, $6 // Check for OS support of XMM and YMM registers.
+	JE nocpuinfo
+#endif
+noavx:
+	MOVB $0, runtime·support_avx(SB)
+	MOVB $0, runtime·support_avx2(SB)
+
+nocpuinfo:
+
 needtls:
 	LEAL	runtime·m0+m_tls(SB), DI
 	CALL	runtime·settls(SB)
@@ -122,18 +198,6 @@ TEXT runtime·gosave(SB), NOSPLIT, $0-4
 // restore state from Gobuf; longjmp
 TEXT runtime·gogo(SB), NOSPLIT, $8-4
 	MOVL	buf+0(FP), BX		// gobuf
-
-	// If ctxt is not nil, invoke deletion barrier before overwriting.
-	MOVL	gobuf_ctxt(BX), DX
-	TESTL	DX, DX
-	JZ	nilctxt
-	LEAL	gobuf_ctxt(BX), AX
-	MOVL	AX, 0(SP)
-	MOVL	$0, 4(SP)
-	CALL	runtime·writebarrierptr_prewrite(SB)
-	MOVL	buf+0(FP), BX
-
-nilctxt:
 	MOVL	gobuf_g(BX), DX
 	MOVL	0(DX), CX		// make sure g != nil
 	get_tls(CX)
@@ -242,10 +306,11 @@ switch:
 
 noswitch:
 	// already on m stack, just call directly
+	// Using a tail call here cleans up tracebacks since we won't stop
+	// at an intermediate systemstack.
 	MOVL	DI, DX
 	MOVL	0(DI), DI
-	CALL	DI
-	RET
+	JMP	DI
 
 /*
  * support for morestack
@@ -292,16 +357,14 @@ TEXT runtime·morestack(SB),NOSPLIT,$0-0
 	MOVL	SI, (g_sched+gobuf_g)(SI)
 	LEAL	8(SP), AX // f's SP
 	MOVL	AX, (g_sched+gobuf_sp)(SI)
-	// newstack will fill gobuf.ctxt.
+	MOVL	DX, (g_sched+gobuf_ctxt)(SI)
 
 	// Call newstack on m->g0's stack.
 	MOVL	m_g0(BX), BX
 	MOVL	BX, g(CX)
 	MOVL	(g_sched+gobuf_sp)(BX), SP
-	PUSHQ	DX	// ctxt argument
 	CALL	runtime·newstack(SB)
 	MOVL	$0, 0x1003	// crash if newstack returns
-	POPQ	DX	// keep balance check happy
 	RET
 
 // morestack trampolines
@@ -483,53 +546,12 @@ TEXT runtime·stackcheck(SB), NOSPLIT, $0-0
 	MOVL	0, AX
 	RET
 
-TEXT runtime·memclrNoHeapPointers(SB),NOSPLIT,$0-8
-	MOVL	ptr+0(FP), DI
-	MOVL	n+4(FP), CX
-	MOVQ	CX, BX
-	ANDQ	$3, BX
-	SHRQ	$2, CX
-	MOVQ	$0, AX
-	CLD
-	REP
-	STOSL
-	MOVQ	BX, CX
-	REP
-	STOSB
-	// Note: we zero only 4 bytes at a time so that the tail is at most
-	// 3 bytes. That guarantees that we aren't zeroing pointers with STOSB.
-	// See issue 13160.
-	RET
-
-TEXT runtime·getcallerpc(SB),NOSPLIT,$8-12
-	MOVL	argp+0(FP),AX		// addr of first arg
-	MOVL	-8(AX),AX		// get calling pc
-	MOVL	AX, ret+8(FP)
-	RET
-
 // int64 runtime·cputicks(void)
 TEXT runtime·cputicks(SB),NOSPLIT,$0-0
 	RDTSC
 	SHLQ	$32, DX
 	ADDQ	DX, AX
 	MOVQ	AX, ret+0(FP)
-	RET
-
-// memhash_varlen(p unsafe.Pointer, h seed) uintptr
-// redirects to memhash(p, h, size) using the size
-// stored in the closure.
-TEXT runtime·memhash_varlen(SB),NOSPLIT,$24-12
-	GO_ARGS
-	NO_LOCAL_POINTERS
-	MOVL	p+0(FP), AX
-	MOVL	h+4(FP), BX
-	MOVL	4(DX), CX
-	MOVL	AX, 0(SP)
-	MOVL	BX, 4(SP)
-	MOVL	CX, 8(SP)
-	CALL	runtime·memhash(SB)
-	MOVL	16(SP), AX
-	MOVL	AX, ret+8(FP)
 	RET
 
 // hash function using AES hardware instructions
@@ -580,24 +602,6 @@ TEXT runtime·memequal_varlen(SB),NOSPLIT,$0-9
 	RET
 eq:
 	MOVB    $1, ret+8(FP)
-	RET
-
-// eqstring tests whether two strings are equal.
-// The compiler guarantees that strings passed
-// to eqstring have equal length.
-// See runtime_test.go:eqstring_generic for
-// equivalent Go code.
-TEXT runtime·eqstring(SB),NOSPLIT,$0-17
-	MOVL	s1_base+0(FP), SI
-	MOVL	s2_base+8(FP), DI
-	CMPL	SI, DI
-	JEQ	same
-	MOVL	s1_len+4(FP), BX
-	CALL	runtime·memeqbody(SB)
-	MOVB	AX, ret+16(FP)
-	RET
-same:
-	MOVB	$1, ret+16(FP)
 	RET
 
 // a in SI
@@ -965,27 +969,6 @@ TEXT runtime·goexit(SB),NOSPLIT,$0-0
 	CALL	runtime·goexit1(SB)	// does not return
 	// traceback from goexit1 must hit code range of goexit
 	BYTE	$0x90	// NOP
-
-TEXT runtime·prefetcht0(SB),NOSPLIT,$0-4
-	MOVL	addr+0(FP), AX
-	PREFETCHT0	(AX)
-	RET
-
-TEXT runtime·prefetcht1(SB),NOSPLIT,$0-4
-	MOVL	addr+0(FP), AX
-	PREFETCHT1	(AX)
-	RET
-
-
-TEXT runtime·prefetcht2(SB),NOSPLIT,$0-4
-	MOVL	addr+0(FP), AX
-	PREFETCHT2	(AX)
-	RET
-
-TEXT runtime·prefetchnta(SB),NOSPLIT,$0-4
-	MOVL	addr+0(FP), AX
-	PREFETCHNTA	(AX)
-	RET
 
 TEXT ·checkASM(SB),NOSPLIT,$0-1
 	MOVB	$1, ret+0(FP)

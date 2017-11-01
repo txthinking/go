@@ -18,7 +18,6 @@ import (
 	"path"
 	"path/filepath"
 	"regexp"
-	"runtime"
 	"sort"
 	"strings"
 	"text/template"
@@ -59,7 +58,7 @@ followed by detailed output for each failed package.
 the file pattern "*_test.go".
 Files whose names begin with "_" (including "_test.go") or "." are ignored.
 These additional files can contain test functions, benchmark functions, and
-example functions.  See 'go help testfunc' for more.
+example functions. See 'go help testfunc' for more.
 Each listed package causes the execution of a separate test binary.
 
 Test files that declare a package with the suffix "_test" will be compiled as a
@@ -68,7 +67,7 @@ separate package, and then linked and run with the main test binary.
 The go tool will ignore a directory named "testdata", making it available
 to hold ancillary data needed by the tests.
 
-By default, go test needs no arguments.  It compiles and tests the package
+By default, go test needs no arguments. It compiles and tests the package
 with source in the current directory, including tests, and runs the tests.
 
 The package is built in a temporary directory so it does not interfere with the
@@ -130,7 +129,7 @@ and flags that apply to the resulting test binary.
 
 Several of the flags control profiling and write an execution profile
 suitable for "go tool pprof"; run "go tool pprof -h" for more
-information.  The --alloc_space, --alloc_objects, and --show_bytes
+information. The --alloc_space, --alloc_objects, and --show_bytes
 options of pprof control how the information is presented.
 
 The following flags are recognized by the 'go test' command and
@@ -142,12 +141,17 @@ control the execution of any test:
 
 const testFlag2 = `
 	-bench regexp
-	    Run (sub)benchmarks matching a regular expression.
-	    The given regular expression is split into smaller ones by
-	    top-level '/', where each must match the corresponding part of a
-	    benchmark's identifier.
-	    By default, no benchmarks run. To run all benchmarks,
-	    use '-bench .' or '-bench=.'.
+	    Run only those benchmarks matching a regular expression.
+	    By default, no benchmarks are run. 
+	    To run all benchmarks, use '-bench .' or '-bench=.'.
+	    The regular expression is split by unbracketed slash (/)
+	    characters into a sequence of regular expressions, and each
+	    part of a benchmark's identifier must match the corresponding
+	    element in the sequence, if any. Possible parents of matches
+	    are run with b.N=1 to identify sub-benchmarks. For example,
+	    given -bench=X/Y, top-level benchmarks matching X are run
+	    with b.N=1 to find any sub-benchmarks matching Y, which are
+	    then run in full.
 
 	-benchtime t
 	    Run enough iterations of each benchmark to take t, specified
@@ -161,6 +165,10 @@ const testFlag2 = `
 
 	-cover
 	    Enable coverage analysis.
+	    Note that because coverage works by annotating the source
+	    code before compilation, compilation and test failures with
+	    coverage enabled may report line numbers that don't correspond
+	    to the original sources.
 
 	-covermode set,count,atomic
 	    Set the mode for coverage analysis for the package[s]
@@ -181,8 +189,13 @@ const testFlag2 = `
 
 	-cpu 1,2,4
 	    Specify a list of GOMAXPROCS values for which the tests or
-	    benchmarks should be executed.  The default is the current value
+	    benchmarks should be executed. The default is the current value
 	    of GOMAXPROCS.
+
+	-list regexp
+	    List tests, benchmarks, or examples matching the regular expression.
+	    No tests, benchmarks or examples will be run. This will only
+	    list top-level tests. No subtest or subbenchmarks will be shown.
 
 	-parallel n
 	    Allow parallel execution of test functions that call t.Parallel.
@@ -195,9 +208,13 @@ const testFlag2 = `
 
 	-run regexp
 	    Run only those tests and examples matching the regular expression.
-	    For tests the regular expression is split into smaller ones by
-	    top-level '/', where each must match the corresponding part of a
-	    test's identifier.
+	    For tests, the regular expression is split by unbracketed slash (/)
+	    characters into a sequence of regular expressions, and each part
+	    of a test's identifier must match the corresponding element in
+	    the sequence, if any. Note that possible parents of matches are
+	    run too, so that -run=X/Y matches and runs and reports the result
+	    of all tests matching X, even those without sub-tests matching Y,
+	    because it must run them to look for those sub-tests.
 
 	-short
 	    Tell long-running tests to shorten their run time.
@@ -205,8 +222,8 @@ const testFlag2 = `
 	    the Go tree can run a sanity check but not spend time running
 	    exhaustive tests.
 
-	-timeout t
-	    If a test runs longer than t, panic.
+	-timeout d
+	    If a test binary runs longer than duration d, panic.
 	    The default is 10 minutes (10m).
 
 	-v
@@ -229,7 +246,7 @@ profile the tests during execution:
 	    calling runtime.SetBlockProfileRate with n.
 	    See 'go doc runtime.SetBlockProfileRate'.
 	    The profiler aims to sample, on average, one blocking event every
-	    n nanoseconds the program spends blocked.  By default,
+	    n nanoseconds the program spends blocked. By default,
 	    if -test.blockprofile is set without this flag, all blocking events
 	    are recorded, equivalent to -test.blockprofilerate=1.
 
@@ -247,7 +264,7 @@ profile the tests during execution:
 
 	-memprofilerate n
 	    Enable more precise (and expensive) memory profiles by setting
-	    runtime.MemProfileRate.  See 'go doc runtime.MemProfileRate'.
+	    runtime.MemProfileRate. See 'go doc runtime.MemProfileRate'.
 	    To profile all memory allocations, use -test.memprofilerate=1
 	    and pass --alloc_space flag to the pprof tool.
 
@@ -352,8 +369,8 @@ comment is compiled but not executed. An example with no text after
 "Output:" is compiled, executed, and expected to produce no output.
 
 Godoc displays the body of ExampleXXX to demonstrate the use
-of the function, constant, or variable XXX.  An example of a method M with
-receiver type T or *T is named ExampleT_M.  There may be multiple examples
+of the function, constant, or variable XXX. An example of a method M with
+receiver type T or *T is named ExampleT_M. There may be multiple examples
 for a given function, constant, or variable, distinguished by a trailing _xxx,
 where xxx is a suffix not beginning with an upper case letter.
 
@@ -400,17 +417,18 @@ var (
 	testTimeout      string          // -timeout flag
 	testArgs         []string
 	testBench        bool
+	testList         bool
 	testStreamOutput bool // show output as it is generated
 	testShowPass     bool // show passing output
 
 	testKillTimeout = 10 * time.Minute
 )
 
-var testMainDeps = map[string]bool{
+var testMainDeps = []string{
 	// Dependencies for testmain.
-	"testing":                   true,
-	"testing/internal/testdeps": true,
-	"os": true,
+	"os",
+	"testing",
+	"testing/internal/testdeps",
 }
 
 func runTest(cmd *base.Command, args []string) {
@@ -447,7 +465,7 @@ func runTest(cmd *base.Command, args []string) {
 	// show passing test output (after buffering) with -v flag.
 	// must buffer because tests are running in parallel, and
 	// otherwise the output will get mixed.
-	testShowPass = testV
+	testShowPass = testV || testList
 
 	// stream test output (no buffering) when no package has
 	// been given on the command line (implicit current directory)
@@ -471,7 +489,7 @@ func runTest(cmd *base.Command, args []string) {
 		cfg.BuildV = testV
 
 		deps := make(map[string]bool)
-		for dep := range testMainDeps {
+		for _, dep := range testMainDeps {
 			deps[dep] = true
 		}
 
@@ -492,9 +510,6 @@ func runTest(cmd *base.Command, args []string) {
 		if deps["C"] {
 			delete(deps, "C")
 			deps["runtime/cgo"] = true
-			if cfg.Goos == runtime.GOOS && cfg.Goarch == runtime.GOARCH && !cfg.BuildRace && !cfg.BuildMSan {
-				deps["cmd/cgo"] = true
-			}
 		}
 		// Ignore pseudo-packages.
 		delete(deps, "unsafe")
@@ -507,9 +522,9 @@ func runTest(cmd *base.Command, args []string) {
 		}
 		sort.Strings(all)
 
-		a := &work.Action{}
+		a := &work.Action{Mode: "go test -i"}
 		for _, p := range load.PackagesForBuild(all) {
-			a.Deps = append(a.Deps, b.Action(work.ModeInstall, work.ModeInstall, p))
+			a.Deps = append(a.Deps, b.CompileAction(work.ModeInstall, work.ModeInstall, p))
 		}
 		b.Do(a)
 		if !testC || a.Failed {
@@ -545,9 +560,6 @@ func runTest(cmd *base.Command, args []string) {
 			if p.ImportPath == "unsafe" {
 				continue
 			}
-			p.Stale = true // rebuild
-			p.StaleReason = "rebuild for coverage"
-			p.Internal.Fake = true // do not warn about rebuild
 			p.Internal.CoverMode = testCoverMode
 			var coverFiles []string
 			coverFiles = append(coverFiles, p.GoFiles...)
@@ -585,7 +597,7 @@ func runTest(cmd *base.Command, args []string) {
 	}
 
 	// Ultimately the goal is to print the output.
-	root := &work.Action{Deps: prints}
+	root := &work.Action{Mode: "go test", Deps: prints}
 
 	// Force the printing of results to happen in order,
 	// one at a time.
@@ -608,68 +620,23 @@ func runTest(cmd *base.Command, args []string) {
 		}
 	}
 
-	// If we are building any out-of-date packages other
-	// than those under test, warn.
-	okBuild := map[*load.Package]bool{}
-	for _, p := range pkgs {
-		okBuild[p] = true
-	}
-	warned := false
-	for _, a := range work.ActionList(root) {
-		if a.Package == nil || okBuild[a.Package] {
-			continue
-		}
-		okBuild[a.Package] = true // warn at most once
-
-		// Don't warn about packages being rebuilt because of
-		// things like coverage analysis.
-		for _, p1 := range a.Package.Internal.Imports {
-			if p1.Internal.Fake {
-				a.Package.Internal.Fake = true
-			}
-		}
-
-		if a.Func != nil && !okBuild[a.Package] && !a.Package.Internal.Fake && !a.Package.Internal.Local {
-			if !warned {
-				fmt.Fprintf(os.Stderr, "warning: building out-of-date packages:\n")
-				warned = true
-			}
-			fmt.Fprintf(os.Stderr, "\t%s\n", a.Package.ImportPath)
-		}
-	}
-	if warned {
-		args := strings.Join(pkgArgs, " ")
-		if args != "" {
-			args = " " + args
-		}
-		extraOpts := ""
-		if cfg.BuildRace {
-			extraOpts = "-race "
-		}
-		if cfg.BuildMSan {
-			extraOpts = "-msan "
-		}
-		fmt.Fprintf(os.Stderr, "installing these packages with 'go test %s-i%s' will speed future tests.\n\n", extraOpts, args)
-	}
-
 	b.Do(root)
 }
 
 // ensures that package p imports the named package
 func ensureImport(p *load.Package, pkg string) {
-	for _, d := range p.Internal.Deps {
+	for _, d := range p.Internal.Imports {
 		if d.Name == pkg {
 			return
 		}
 	}
 
-	a := load.LoadPackage(pkg, &load.ImportStack{})
-	if a.Error != nil {
-		base.Fatalf("load %s: %v", pkg, a.Error)
+	p1 := load.LoadPackage(pkg, &load.ImportStack{})
+	if p1.Error != nil {
+		base.Fatalf("load %s: %v", pkg, p1.Error)
 	}
-	load.ComputeStale(a)
 
-	p.Internal.Imports = append(p.Internal.Imports, a)
+	p.Internal.Imports = append(p.Internal.Imports, p1)
 }
 
 var windowsBadWords = []string{
@@ -681,9 +648,9 @@ var windowsBadWords = []string{
 
 func builderTest(b *work.Builder, p *load.Package) (buildAction, runAction, printAction *work.Action, err error) {
 	if len(p.TestGoFiles)+len(p.XTestGoFiles) == 0 {
-		build := b.Action(work.ModeBuild, work.ModeBuild, p)
-		run := &work.Action{Package: p, Deps: []*work.Action{build}}
-		print := &work.Action{Func: builderNoTest, Package: p, Deps: []*work.Action{run}}
+		build := b.CompileAction(work.ModeBuild, work.ModeBuild, p)
+		run := &work.Action{Mode: "test run", Package: p, Deps: []*work.Action{build}}
+		print := &work.Action{Mode: "test print", Func: builderNoTest, Package: p, Deps: []*work.Action{run}}
 		return build, run, print, nil
 	}
 
@@ -754,29 +721,6 @@ func builderTest(b *work.Builder, p *load.Package) (buildAction, runAction, prin
 	}
 	testBinary := elem + ".test"
 
-	// The ptest package needs to be importable under the
-	// same import path that p has, but we cannot put it in
-	// the usual place in the temporary tree, because then
-	// other tests will see it as the real package.
-	// Instead we make a _test directory under the import path
-	// and then repeat the import path there. We tell the
-	// compiler and linker to look in that _test directory first.
-	//
-	// That is, if the package under test is unicode/utf8,
-	// then the normal place to write the package archive is
-	// $WORK/unicode/utf8.a, but we write the test package archive to
-	// $WORK/unicode/utf8/_test/unicode/utf8.a.
-	// We write the external test package archive to
-	// $WORK/unicode/utf8/_test/unicode/utf8_test.a.
-	testDir := filepath.Join(b.WorkDir, filepath.FromSlash(p.ImportPath+"/_test"))
-	ptestObj := work.BuildToolchain.Pkgpath(testDir, p)
-
-	// Create the directory for the .a files.
-	ptestDir, _ := filepath.Split(ptestObj)
-	if err := b.Mkdir(ptestDir); err != nil {
-		return nil, nil, nil, err
-	}
-
 	// Should we apply coverage analysis locally,
 	// only for this package and only for this test?
 	// Yes, if -cover is on but -coverpkg has not specified
@@ -790,14 +734,10 @@ func builderTest(b *work.Builder, p *load.Package) (buildAction, runAction, prin
 		ptest.GoFiles = nil
 		ptest.GoFiles = append(ptest.GoFiles, p.GoFiles...)
 		ptest.GoFiles = append(ptest.GoFiles, p.TestGoFiles...)
-		ptest.Internal.Target = ""
+		ptest.Target = ""
 		ptest.Imports = str.StringList(p.Imports, p.TestImports)
 		ptest.Internal.Imports = append(append([]*load.Package{}, p.Internal.Imports...), imports...)
-		ptest.Internal.Pkgdir = testDir
-		ptest.Internal.Fake = true
 		ptest.Internal.ForceLibrary = true
-		ptest.Stale = true
-		ptest.StaleReason = "rebuild for test"
 		ptest.Internal.Build = new(build.Package)
 		*ptest.Internal.Build = *p.Internal.Build
 		m := map[string][]token.Position{}
@@ -830,22 +770,23 @@ func builderTest(b *work.Builder, p *load.Package) (buildAction, runAction, prin
 				Dir:        p.Dir,
 				GoFiles:    p.XTestGoFiles,
 				Imports:    p.XTestImports,
-				Stale:      true,
 			},
 			Internal: load.PackageInternal{
 				LocalPrefix: p.Internal.LocalPrefix,
 				Build: &build.Package{
 					ImportPos: p.Internal.Build.XTestImportPos,
 				},
-				Imports:  ximports,
-				Pkgdir:   testDir,
-				Fake:     true,
-				External: true,
+				Imports: ximports,
 			},
 		}
 		if pxtestNeedsPtest {
 			pxtest.Internal.Imports = append(pxtest.Internal.Imports, ptest)
 		}
+	}
+
+	testDir := b.NewObjdir()
+	if err := b.Mkdir(testDir); err != nil {
+		return nil, nil, nil, err
 	}
 
 	// Action for building pkg.test.
@@ -854,21 +795,23 @@ func builderTest(b *work.Builder, p *load.Package) (buildAction, runAction, prin
 			Name:       "main",
 			Dir:        testDir,
 			GoFiles:    []string{"_testmain.go"},
-			ImportPath: "testmain",
+			ImportPath: p.ImportPath + " (testmain)",
 			Root:       p.Root,
-			Stale:      true,
 		},
 		Internal: load.PackageInternal{
 			Build:     &build.Package{Name: "main"},
-			Pkgdir:    testDir,
-			Fake:      true,
-			OmitDWARF: !testC && !testNeedBinary,
+			OmitDebug: !testC && !testNeedBinary,
 		},
 	}
 
 	// The generated main also imports testing, regexp, and os.
+	// Also the linker introduces implicit dependencies reported by LinkerDeps.
 	stk.Push("testmain")
-	for dep := range testMainDeps {
+	deps := testMainDeps // cap==len, so safe for append
+	for _, d := range load.LinkerDeps(p) {
+		deps = append(deps, d)
+	}
+	for _, dep := range deps {
 		if dep == ptest.ImportPath {
 			pmain.Internal.Imports = append(pmain.Internal.Imports, ptest)
 		} else {
@@ -913,24 +856,21 @@ func builderTest(b *work.Builder, p *load.Package) (buildAction, runAction, prin
 
 	if ptest != p && localCover {
 		// We have made modifications to the package p being tested
-		// and are rebuilding p (as ptest), writing it to the testDir tree.
-		// Arrange to rebuild, writing to that same tree, all packages q
-		// such that the test depends on q, and q depends on p.
+		// and are rebuilding p (as ptest).
+		// Arrange to rebuild all packages q such that
+		// the test depends on q and q depends on p.
 		// This makes sure that q sees the modifications to p.
 		// Strictly speaking, the rebuild is only necessary if the
 		// modifications to p change its export metadata, but
 		// determining that is a bit tricky, so we rebuild always.
+		// TODO(rsc): Once we get export metadata changes
+		// handled properly, look into the expense of dropping
+		// "&& localCover" above.
 		//
 		// This will cause extra compilation, so for now we only do it
 		// when testCover is set. The conditions are more general, though,
 		// and we may find that we need to do it always in the future.
-		recompileForTest(pmain, p, ptest, testDir)
-	}
-
-	if cfg.BuildContext.GOOS == "darwin" {
-		if cfg.BuildContext.GOARCH == "arm" || cfg.BuildContext.GOARCH == "arm64" {
-			t.NeedCgo = true
-		}
+		recompileForTest(pmain, p, ptest)
 	}
 
 	for _, cp := range pmain.Internal.Imports {
@@ -940,34 +880,15 @@ func builderTest(b *work.Builder, p *load.Package) (buildAction, runAction, prin
 	}
 
 	if !cfg.BuildN {
-		// writeTestmain writes _testmain.go. This must happen after recompileForTest,
-		// because recompileForTest modifies XXX.
-		if err := writeTestmain(filepath.Join(testDir, "_testmain.go"), t); err != nil {
+		// writeTestmain writes _testmain.go,
+		// using the test description gathered in t.
+		if err := writeTestmain(testDir+"_testmain.go", t); err != nil {
 			return nil, nil, nil, err
 		}
 	}
 
-	load.ComputeStale(pmain)
-
-	if ptest != p {
-		a := b.Action(work.ModeBuild, work.ModeBuild, ptest)
-		a.Objdir = testDir + string(filepath.Separator) + "_obj_test" + string(filepath.Separator)
-		a.Objpkg = ptestObj
-		a.Target = ptestObj
-		a.Link = false
-	}
-
-	if pxtest != nil {
-		a := b.Action(work.ModeBuild, work.ModeBuild, pxtest)
-		a.Objdir = testDir + string(filepath.Separator) + "_obj_xtest" + string(filepath.Separator)
-		a.Objpkg = work.BuildToolchain.Pkgpath(testDir, pxtest)
-		a.Target = a.Objpkg
-	}
-
-	a := b.Action(work.ModeBuild, work.ModeBuild, pmain)
-	a.Objdir = testDir + string(filepath.Separator)
-	a.Objpkg = filepath.Join(testDir, "main.a")
-	a.Target = filepath.Join(testDir, testBinary) + cfg.ExeSuffix
+	a := b.LinkAction(work.ModeBuild, work.ModeBuild, pmain)
+	a.Target = testDir + testBinary + cfg.ExeSuffix
 	if cfg.Goos == "windows" {
 		// There are many reserved words on Windows that,
 		// if used in the name of an executable, cause Windows
@@ -993,7 +914,7 @@ func builderTest(b *work.Builder, p *load.Package) (buildAction, runAction, prin
 		// we could just do this always on Windows.
 		for _, bad := range windowsBadWords {
 			if strings.Contains(testBinary, bad) {
-				a.Target = filepath.Join(testDir, "test.test") + cfg.ExeSuffix
+				a.Target = testDir + "test.test" + cfg.ExeSuffix
 				break
 			}
 		}
@@ -1009,7 +930,9 @@ func builderTest(b *work.Builder, p *load.Package) (buildAction, runAction, prin
 				target = filepath.Join(base.Cwd, target)
 			}
 		}
+		pmain.Target = target
 		buildAction = &work.Action{
+			Mode:    "test build",
 			Func:    work.BuildInstallFunc,
 			Deps:    []*work.Action{buildAction},
 			Package: pmain,
@@ -1018,21 +941,25 @@ func builderTest(b *work.Builder, p *load.Package) (buildAction, runAction, prin
 		runAction = buildAction // make sure runAction != nil even if not running test
 	}
 	if testC {
-		printAction = &work.Action{Package: p, Deps: []*work.Action{runAction}} // nop
+		printAction = &work.Action{Mode: "test print (nop)", Package: p, Deps: []*work.Action{runAction}} // nop
 	} else {
 		// run test
 		runAction = &work.Action{
+			Mode:       "test run",
 			Func:       builderRunTest,
 			Deps:       []*work.Action{buildAction},
 			Package:    p,
 			IgnoreFail: true,
 		}
 		cleanAction := &work.Action{
+			Mode:    "test clean",
 			Func:    builderCleanTest,
 			Deps:    []*work.Action{runAction},
 			Package: p,
+			Objdir:  testDir,
 		}
 		printAction = &work.Action{
+			Mode:    "test print",
 			Func:    builderPrintTest,
 			Deps:    []*work.Action{cleanAction},
 			Package: p,
@@ -1060,7 +987,7 @@ Search:
 	return stk
 }
 
-func recompileForTest(pmain, preal, ptest *load.Package, testDir string) {
+func recompileForTest(pmain, preal, ptest *load.Package) {
 	// The "test copy" of preal is ptest.
 	// For each package that depends on preal, make a "test copy"
 	// that depends on ptest. And so on, up the dependency tree.
@@ -1073,28 +1000,19 @@ func recompileForTest(pmain, preal, ptest *load.Package, testDir string) {
 				return
 			}
 			didSplit = true
-			if p.Internal.Pkgdir != testDir {
-				p1 := new(load.Package)
-				testCopy[p] = p1
-				*p1 = *p
-				p1.Internal.Imports = make([]*load.Package, len(p.Internal.Imports))
-				copy(p1.Internal.Imports, p.Internal.Imports)
-				p = p1
-				p.Internal.Pkgdir = testDir
-				p.Internal.Target = ""
-				p.Internal.Fake = true
-				p.Stale = true
-				p.StaleReason = "depends on package being tested"
+			if testCopy[p] != nil {
+				panic("recompileForTest loop")
 			}
+			p1 := new(load.Package)
+			testCopy[p] = p1
+			*p1 = *p
+			p1.Internal.Imports = make([]*load.Package, len(p.Internal.Imports))
+			copy(p1.Internal.Imports, p.Internal.Imports)
+			p = p1
+			p.Target = ""
 		}
 
-		// Update p.Deps and p.Internal.Imports to use at test copies.
-		for i, dep := range p.Internal.Deps {
-			if p1 := testCopy[dep]; p1 != nil && p1 != dep {
-				split()
-				p.Internal.Deps[i] = p1
-			}
-		}
+		// Update p.Internal.Imports to use test copies.
 		for i, imp := range p.Internal.Imports {
 			if p1 := testCopy[imp]; p1 != nil && p1 != imp {
 				split()
@@ -1269,9 +1187,10 @@ func builderCleanTest(b *work.Builder, a *work.Action) error {
 	if cfg.BuildWork {
 		return nil
 	}
-	run := a.Deps[0]
-	testDir := filepath.Join(b.WorkDir, filepath.FromSlash(run.Package.ImportPath+"/_test"))
-	os.RemoveAll(testDir)
+	if cfg.BuildX {
+		b.Showcmd("", "rm -r %s", a.Objdir)
+	}
+	os.RemoveAll(a.Objdir)
 	return nil
 }
 
@@ -1378,7 +1297,6 @@ type testFuncs struct {
 	NeedTest    bool
 	ImportXtest bool
 	NeedXtest   bool
-	NeedCgo     bool
 	Cover       []coverInfo
 }
 
@@ -1506,10 +1424,6 @@ import (
 {{end}}
 {{range $i, $p := .Cover}}
 	_cover{{$i}} {{$p.Package.ImportPath | printf "%q"}}
-{{end}}
-
-{{if .NeedCgo}}
-	_ "runtime/cgo"
 {{end}}
 )
 

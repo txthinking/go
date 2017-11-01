@@ -5,10 +5,11 @@
 package ssa
 
 import (
-	"cmd/internal/obj"
+	"cmd/compile/internal/types"
 	"cmd/internal/src"
 	"fmt"
 	"math"
+	"strings"
 )
 
 // A Value represents a value in the SSA representation of the program.
@@ -24,7 +25,7 @@ type Value struct {
 
 	// The type of this value. Normally this will be a Go type, but there
 	// are a few other pseudo-types, see type.go.
-	Type Type
+	Type *types.Type
 
 	// Auxiliary info for this value. The type of this information depends on the opcode and type.
 	// AuxInt is used for integer values, Aux is used for other values.
@@ -97,7 +98,7 @@ func (v *Value) AuxValAndOff() ValAndOff {
 	return ValAndOff(v.AuxInt)
 }
 
-// long form print.  v# = opcode <type> [aux] args [: reg]
+// long form print.  v# = opcode <type> [aux] args [: reg] (names)
 func (v *Value) LongString() string {
 	s := fmt.Sprintf("v%d = %s", v.ID, v.Op)
 	s += " <" + v.Type.String() + ">"
@@ -107,7 +108,19 @@ func (v *Value) LongString() string {
 	}
 	r := v.Block.Func.RegAlloc
 	if int(v.ID) < len(r) && r[v.ID] != nil {
-		s += " : " + r[v.ID].Name()
+		s += " : " + r[v.ID].String()
+	}
+	var names []string
+	for name, values := range v.Block.Func.NamedValues {
+		for _, value := range values {
+			if value == v {
+				names = append(names, name.String())
+				break // drop duplicates.
+			}
+		}
+	}
+	if len(names) != 0 {
+		s += " (" + strings.Join(names, ", ") + ")"
 	}
 	return s
 }
@@ -211,7 +224,29 @@ func (v *Value) reset(op Op) {
 
 // copyInto makes a new value identical to v and adds it to the end of b.
 func (v *Value) copyInto(b *Block) *Value {
-	c := b.NewValue0(v.Pos, v.Op, v.Type)
+	c := b.NewValue0(v.Pos, v.Op, v.Type) // Lose the position, this causes line number churn otherwise.
+	c.Aux = v.Aux
+	c.AuxInt = v.AuxInt
+	c.AddArgs(v.Args...)
+	for _, a := range v.Args {
+		if a.Type.IsMemory() {
+			v.Fatalf("can't move a value with a memory arg %s", v.LongString())
+		}
+	}
+	return c
+}
+
+// copyIntoNoXPos makes a new value identical to v and adds it to the end of b.
+// The copied value receives no source code position to avoid confusing changes
+// in debugger information (the intended user is the register allocator).
+func (v *Value) copyIntoNoXPos(b *Block) *Value {
+	return v.copyIntoWithXPos(b, src.NoXPos)
+}
+
+// copyIntoWithXPos makes a new value identical to v and adds it to the end of b.
+// The supplied position is used as the position of the new value.
+func (v *Value) copyIntoWithXPos(b *Block, pos src.XPos) *Value {
+	c := b.NewValue0(pos, v.Op, v.Type)
 	c.Aux = v.Aux
 	c.AuxInt = v.AuxInt
 	c.AddArgs(v.Args...)
@@ -232,41 +267,6 @@ func (v *Value) Fatalf(msg string, args ...interface{}) {
 // isGenericIntConst returns whether v is a generic integer constant.
 func (v *Value) isGenericIntConst() bool {
 	return v != nil && (v.Op == OpConst64 || v.Op == OpConst32 || v.Op == OpConst16 || v.Op == OpConst8)
-}
-
-// ExternSymbol is an aux value that encodes a variable's
-// constant offset from the static base pointer.
-type ExternSymbol struct {
-	Typ Type // Go type
-	Sym *obj.LSym
-	// Note: the offset for an external symbol is not
-	// calculated until link time.
-}
-
-// ArgSymbol is an aux value that encodes an argument or result
-// variable's constant offset from FP (FP = SP + framesize).
-type ArgSymbol struct {
-	Typ  Type   // Go type
-	Node GCNode // A *gc.Node referring to the argument/result variable.
-}
-
-// AutoSymbol is an aux value that encodes a local variable's
-// constant offset from SP.
-type AutoSymbol struct {
-	Typ  Type   // Go type
-	Node GCNode // A *gc.Node referring to a local (auto) variable.
-}
-
-func (s *ExternSymbol) String() string {
-	return s.Sym.String()
-}
-
-func (s *ArgSymbol) String() string {
-	return s.Node.String()
-}
-
-func (s *AutoSymbol) String() string {
-	return s.Node.String()
 }
 
 // Reg returns the register assigned to v, in cmd/internal/obj/$ARCH numbering.
@@ -305,10 +305,8 @@ func (v *Value) RegName() string {
 }
 
 // MemoryArg returns the memory argument for the Value.
-// The returned value, if non-nil, will be memory-typed,
-// except in the case where v is Select1, in which case
-// the returned value will be a tuple containing a memory
-// type. Otherwise, nil is returned.
+// The returned value, if non-nil, will be memory-typed (or a tuple with a memory-typed second part).
+// Otherwise, nil is returned.
 func (v *Value) MemoryArg() *Value {
 	if v.Op == OpPhi {
 		v.Fatalf("MemoryArg on Phi")
@@ -317,8 +315,7 @@ func (v *Value) MemoryArg() *Value {
 	if na == 0 {
 		return nil
 	}
-	if m := v.Args[na-1]; m.Type.IsMemory() ||
-		(v.Op == OpSelect1 && m.Type.FieldType(1).IsMemory()) {
+	if m := v.Args[na-1]; m.Type.IsMemory() {
 		return m
 	}
 	return nil

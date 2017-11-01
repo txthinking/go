@@ -7,10 +7,93 @@
 #include "funcdata.h"
 #include "textflag.h"
 
+// _rt0_386 is common startup code for most 386 systems when using
+// internal linking. This is the entry point for the program from the
+// kernel for an ordinary -buildmode=exe program. The stack holds the
+// number of arguments and the C-style argv.
+TEXT _rt0_386(SB),NOSPLIT,$8
+	MOVL	8(SP), AX	// argc
+	LEAL	12(SP), BX	// argv
+	MOVL	AX, 0(SP)
+	MOVL	BX, 4(SP)
+	JMP	runtime·rt0_go(SB)
+
+// _rt0_386_lib is common startup code for most 386 systems when
+// using -buildmode=c-archive or -buildmode=c-shared. The linker will
+// arrange to invoke this function as a global constructor (for
+// c-archive) or when the shared library is loaded (for c-shared).
+// We expect argc and argv to be passed on the stack following the
+// usual C ABI.
+TEXT _rt0_386_lib(SB),NOSPLIT,$0
+	PUSHL	BP
+	MOVL	SP, BP
+	PUSHL	BX
+	PUSHL	SI
+	PUSHL	DI
+
+	MOVL	8(BP), AX
+	MOVL	AX, _rt0_386_lib_argc<>(SB)
+	MOVL	12(BP), AX
+	MOVL	AX, _rt0_386_lib_argv<>(SB)
+
+	// Synchronous initialization.
+	CALL	runtime·libpreinit(SB)
+
+	SUBL	$8, SP
+
+	// Create a new thread to do the runtime initialization.
+	MOVL	_cgo_sys_thread_create(SB), AX
+	TESTL	AX, AX
+	JZ	nocgo
+
+	// Align stack to call C function.
+	// We moved SP to BP above, but BP was clobbered by the libpreinit call.
+	MOVL	SP, BP
+	ANDL	$~15, SP
+
+	MOVL	$_rt0_386_lib_go(SB), BX
+	MOVL	BX, 0(SP)
+	MOVL	$0, 4(SP)
+
+	CALL	AX
+
+	MOVL	BP, SP
+
+	JMP	restore
+
+nocgo:
+	MOVL	$0x800000, 0(SP)                    // stacksize = 8192KB
+	MOVL	$_rt0_386_lib_go(SB), AX
+	MOVL	AX, 4(SP)                           // fn
+	CALL	runtime·newosproc0(SB)
+
+restore:
+	ADDL	$8, SP
+	POPL	DI
+	POPL	SI
+	POPL	BX
+	POPL	BP
+	RET
+
+// _rt0_386_lib_go initializes the Go runtime.
+// This is started in a separate thread by _rt0_386_lib.
+TEXT _rt0_386_lib_go(SB),NOSPLIT,$8
+	MOVL	_rt0_386_lib_argc<>(SB), AX
+	MOVL	AX, 0(SP)
+	MOVL	_rt0_386_lib_argv<>(SB), AX
+	MOVL	AX, 4(SP)
+	JMP	runtime·rt0_go(SB)
+
+DATA _rt0_386_lib_argc<>(SB)/4, $0
+GLOBL _rt0_386_lib_argc<>(SB),NOPTR, $4
+DATA _rt0_386_lib_argv<>(SB)/4, $0
+GLOBL _rt0_386_lib_argv<>(SB),NOPTR, $4
+
 TEXT runtime·rt0_go(SB),NOSPLIT,$0
-	// copy arguments forward on an even stack
-	MOVL	argc+0(FP), AX
-	MOVL	argv+4(FP), BX
+	// Copy arguments forward on an even stack.
+	// Users of this function jump to it, they don't call it.
+	MOVL	0(SP), AX
+	MOVL	4(SP), BX
 	SUBL	$128, SP		// plenty of scratch
 	ANDL	$~15, SP
 	MOVL	AX, 120(SP)		// save argc, argv away
@@ -67,30 +150,86 @@ has_cpuid:
 	JNE	notintel
 	CMPL	CX, $0x6C65746E  // "ntel"
 	JNE	notintel
+	MOVB	$1, runtime·isIntel(SB)
 	MOVB	$1, runtime·lfenceBeforeRdtsc(SB)
 notintel:
 
 	// Load EAX=1 cpuid flags
 	MOVL	$1, AX
 	CPUID
-	MOVL	CX, AX // Move to global variable clobbers CX when generating PIC
-	MOVL	AX, runtime·cpuid_ecx(SB)
-	MOVL	DX, runtime·cpuid_edx(SB)
+	MOVL	CX, DI // Move to global variable clobbers CX when generating PIC
+	MOVL	AX, runtime·processorVersionInfo(SB)
 
 	// Check for MMX support
-	TESTL	$(1<<23), DX	// MMX
-	JZ 	bad_proc
+	TESTL	$(1<<23), DX // MMX
+	JZ	bad_proc
 
+	TESTL	$(1<<26), DX // SSE2
+	SETNE	runtime·support_sse2(SB)
+
+	TESTL	$(1<<9), DI // SSSE3
+	SETNE	runtime·support_ssse3(SB)
+
+	TESTL	$(1<<19), DI // SSE4.1
+	SETNE	runtime·support_sse41(SB)
+
+	TESTL	$(1<<20), DI // SSE4.2
+	SETNE	runtime·support_sse42(SB)
+
+	TESTL	$(1<<23), DI // POPCNT
+	SETNE	runtime·support_popcnt(SB)
+
+	TESTL	$(1<<25), DI // AES
+	SETNE	runtime·support_aes(SB)
+
+	TESTL	$(1<<27), DI // OSXSAVE
+	SETNE	runtime·support_osxsave(SB)
+
+	// If OS support for XMM and YMM is not present
+	// support_avx will be set back to false later.
+	TESTL	$(1<<28), DI // AVX
+	SETNE	runtime·support_avx(SB)
+
+eax7:
 	// Load EAX=7/ECX=0 cpuid flags
 	CMPL	SI, $7
-	JLT	nocpuinfo
+	JLT	osavx
 	MOVL	$7, AX
 	MOVL	$0, CX
 	CPUID
-	MOVL	BX, runtime·cpuid_ebx7(SB)
 
-nocpuinfo:	
+	TESTL	$(1<<3), BX // BMI1
+	SETNE	runtime·support_bmi1(SB)
 
+	// If OS support for XMM and YMM is not present
+	// support_avx2 will be set back to false later.
+	TESTL	$(1<<5), BX
+	SETNE	runtime·support_avx2(SB)
+
+	TESTL	$(1<<8), BX // BMI2
+	SETNE	runtime·support_bmi2(SB)
+
+	TESTL	$(1<<9), BX // ERMS
+	SETNE	runtime·support_erms(SB)
+
+osavx:
+	// nacl does not support XGETBV to test
+	// for XMM and YMM OS support.
+#ifndef GOOS_nacl
+	CMPB	runtime·support_osxsave(SB), $1
+	JNE	noavx
+	MOVL	$0, CX
+	// For XGETBV, OSXSAVE bit is required and sufficient
+	XGETBV
+	ANDL	$6, AX
+	CMPL	AX, $6 // Check for OS support of XMM and YMM registers.
+	JE nocpuinfo
+#endif
+noavx:
+	MOVB $0, runtime·support_avx(SB)
+	MOVB $0, runtime·support_avx2(SB)
+
+nocpuinfo:
 	// if there is an _cgo_init, call it to let it
 	// initialize and to set up GS.  if not,
 	// we set up GS ourselves.
@@ -223,18 +362,6 @@ TEXT runtime·gosave(SB), NOSPLIT, $0-4
 // restore state from Gobuf; longjmp
 TEXT runtime·gogo(SB), NOSPLIT, $8-4
 	MOVL	buf+0(FP), BX		// gobuf
-
-	// If ctxt is not nil, invoke deletion barrier before overwriting.
-	MOVL	gobuf_ctxt(BX), DX
-	TESTL	DX, DX
-	JZ	nilctxt
-	LEAL	gobuf_ctxt(BX), AX
-	MOVL	AX, 0(SP)
-	MOVL	$0, 4(SP)
-	CALL	runtime·writebarrierptr_prewrite(SB)
-	MOVL	buf+0(FP), BX
-
-nilctxt:
 	MOVL	gobuf_g(BX), DX
 	MOVL	0(DX), CX		// make sure g != nil
 	get_tls(CX)
@@ -347,11 +474,12 @@ switch:
 	RET
 
 noswitch:
-	// already on system stack, just call directly
+	// already on system stack; tail call the function
+	// Using a tail call here cleans up tracebacks since we won't stop
+	// at an intermediate systemstack.
 	MOVL	DI, DX
 	MOVL	0(DI), DI
-	CALL	DI
-	RET
+	JMP	DI
 
 /*
  * support for morestack
@@ -397,7 +525,7 @@ TEXT runtime·morestack(SB),NOSPLIT,$0-0
 	MOVL	SI, (g_sched+gobuf_g)(SI)
 	LEAL	4(SP), AX	// f's SP
 	MOVL	AX, (g_sched+gobuf_sp)(SI)
-	// newstack will fill gobuf.ctxt.
+	MOVL	DX, (g_sched+gobuf_ctxt)(SI)
 
 	// Call newstack on m->g0's stack.
 	MOVL	m_g0(BX), BP
@@ -405,10 +533,8 @@ TEXT runtime·morestack(SB),NOSPLIT,$0-0
 	MOVL	(g_sched+gobuf_sp)(BP), AX
 	MOVL	-4(AX), BX	// fault if CALL would, before smashing SP
 	MOVL	AX, SP
-	PUSHL	DX	// ctxt argument
 	CALL	runtime·newstack(SB)
 	MOVL	$0, 0x1003	// crash if newstack returns
-	POPL	DX	// keep balance check happy
 	RET
 
 TEXT runtime·morestack_noctxt(SB),NOSPLIT,$0-0
@@ -793,16 +919,10 @@ TEXT runtime·stackcheck(SB), NOSPLIT, $0-0
 	INT	$3
 	RET
 
-TEXT runtime·getcallerpc(SB),NOSPLIT,$4-8
-	MOVL	argp+0(FP),AX		// addr of first arg
-	MOVL	-4(AX),AX		// get calling pc
-	MOVL	AX, ret+4(FP)
-	RET
-
 // func cputicks() int64
 TEXT runtime·cputicks(SB),NOSPLIT,$0-8
-	TESTL	$0x4000000, runtime·cpuid_edx(SB) // no sse2, no mfence
-	JEQ	done
+	CMPB	runtime·support_sse2(SB), $1
+	JNE	done
 	CMPB	runtime·lfenceBeforeRdtsc(SB), $1
 	JNE	mfence
 	BYTE	$0x0f; BYTE $0xae; BYTE $0xe8 // LFENCE
@@ -827,23 +947,6 @@ TEXT runtime·ldt0setup(SB),NOSPLIT,$16-0
 	RET
 
 TEXT runtime·emptyfunc(SB),0,$0-0
-	RET
-
-// memhash_varlen(p unsafe.Pointer, h seed) uintptr
-// redirects to memhash(p, h, size) using the size
-// stored in the closure.
-TEXT runtime·memhash_varlen(SB),NOSPLIT,$16-12
-	GO_ARGS
-	NO_LOCAL_POINTERS
-	MOVL	p+0(FP), AX
-	MOVL	h+4(FP), BX
-	MOVL	4(DX), CX
-	MOVL	AX, 0(SP)
-	MOVL	BX, 4(SP)
-	MOVL	CX, 8(SP)
-	CALL	runtime·memhash(SB)
-	MOVL	12(SP), AX
-	MOVL	AX, ret+8(FP)
 	RET
 
 // hash function using AES hardware instructions
@@ -1267,23 +1370,6 @@ eq:
 	MOVB    $1, ret+8(FP)
 	RET
 
-// eqstring tests whether two strings are equal.
-// The compiler guarantees that strings passed
-// to eqstring have equal length.
-// See runtime_test.go:eqstring_generic for
-// equivalent Go code.
-TEXT runtime·eqstring(SB),NOSPLIT,$0-17
-	MOVL	s1_base+0(FP), SI
-	MOVL	s2_base+8(FP), DI
-	CMPL	SI, DI
-	JEQ	same
-	MOVL	s1_len+4(FP), BX
-	LEAL	ret+16(FP), AX
-	JMP	runtime·memeqbody(SB)
-same:
-	MOVB	$1, ret+16(FP)
-	RET
-
 TEXT bytes·Equal(SB),NOSPLIT,$0-25
 	MOVL	a_len+4(FP), BX
 	MOVL	b_len+16(FP), CX
@@ -1309,8 +1395,8 @@ TEXT runtime·memeqbody(SB),NOSPLIT,$0-0
 hugeloop:
 	CMPL	BX, $64
 	JB	bigloop
-	TESTL	$0x4000000, runtime·cpuid_edx(SB) // check for sse2
-	JE	bigloop
+	CMPB	runtime·support_sse2(SB), $1
+	JNE	bigloop
 	MOVOU	(SI), X0
 	MOVOU	(DI), X1
 	MOVOU	16(SI), X2
@@ -1453,8 +1539,8 @@ TEXT runtime·cmpbody(SB),NOSPLIT,$0-0
 	JEQ	allsame
 	CMPL	BP, $4
 	JB	small
-	TESTL	$0x4000000, runtime·cpuid_edx(SB) // check for sse2
-	JE	mediumloop
+	CMPB	runtime·support_sse2(SB), $1
+	JNE	mediumloop
 largeloop:
 	CMPL	BP, $16
 	JB	mediumloop
@@ -1580,19 +1666,6 @@ TEXT runtime·goexit(SB),NOSPLIT,$0-0
 	CALL	runtime·goexit1(SB)	// does not return
 	// traceback from goexit1 must hit code range of goexit
 	BYTE	$0x90	// NOP
-
-// Prefetching doesn't seem to help.
-TEXT runtime·prefetcht0(SB),NOSPLIT,$0-4
-	RET
-
-TEXT runtime·prefetcht1(SB),NOSPLIT,$0-4
-	RET
-
-TEXT runtime·prefetcht2(SB),NOSPLIT,$0-4
-	RET
-
-TEXT runtime·prefetchnta(SB),NOSPLIT,$0-4
-	RET
 
 // Add a module's moduledata to the linked list of moduledata objects. This
 // is called from .init_array by a function generated in the linker and so

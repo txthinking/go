@@ -47,6 +47,8 @@
 		%X	base 16, upper-case, two characters per byte
 	Pointer:
 		%p	base 16 notation, with leading 0x
+		The %b, %d, %o, %x and %X verbs also work with pointers,
+		formatting the value exactly as if it were an integer.
 
 	The default format for %v is:
 		bool:                    %t
@@ -79,7 +81,8 @@
 	that is, runes. (This differs from C's printf where the
 	units are always measured in bytes.) Either or both of the flags
 	may be replaced with the character '*', causing their values to be
-	obtained from the next operand, which must be of type int.
+	obtained from the next operand (preceding the one to format),
+	which must be of type int.
 
 	For most values, width is the minimum number of runes to output,
 	padding the formatted form with spaces if necessary.
@@ -192,9 +195,9 @@
 	For example,
 		fmt.Sprintf("%[2]d %[1]d\n", 11, 22)
 	will yield "22 11", while
-		fmt.Sprintf("%[3]*.[2]*[1]f", 12.0, 2, 6),
+		fmt.Sprintf("%[3]*.[2]*[1]f", 12.0, 2, 6)
 	equivalent to
-		fmt.Sprintf("%6.2f", 12.0),
+		fmt.Sprintf("%6.2f", 12.0)
 	will yield " 12.00". Because an explicit index affects subsequent verbs,
 	this notation can be used to print the same values multiple times
 	by resetting the index for the first argument to be repeated:

@@ -82,7 +82,7 @@ func (l *Location) get() *Location {
 }
 
 // String returns a descriptive name for the time zone information,
-// corresponding to the argument to LoadLocation.
+// corresponding to the name argument to LoadLocation or FixedZone.
 func (l *Location) String() string {
 	return l.get().name
 }
@@ -223,7 +223,7 @@ func (l *Location) firstZoneUsed() bool {
 // lookupName returns information about the time zone with
 // the given name (such as "EST") at the given pseudo-Unix time
 // (what the given time of day would be in UTC).
-func (l *Location) lookupName(name string, unix int64) (offset int, isDST bool, ok bool) {
+func (l *Location) lookupName(name string, unix int64) (offset int, ok bool) {
 	l = l.get()
 
 	// First try for a zone with the right name that was actually
@@ -235,9 +235,9 @@ func (l *Location) lookupName(name string, unix int64) (offset int, isDST bool, 
 	for i := range l.zone {
 		zone := &l.zone[i]
 		if zone.name == name {
-			nam, offset, isDST, _, _ := l.lookup(unix - int64(zone.offset))
+			nam, offset, _, _, _ := l.lookup(unix - int64(zone.offset))
 			if nam == zone.name {
-				return offset, isDST, true
+				return offset, true
 			}
 		}
 	}
@@ -246,7 +246,7 @@ func (l *Location) lookupName(name string, unix int64) (offset int, isDST bool, 
 	for i := range l.zone {
 		zone := &l.zone[i]
 		if zone.name == name {
-			return zone.offset, zone.isDST, true
+			return zone.offset, true
 		}
 	}
 
@@ -272,7 +272,7 @@ var zoneinfoOnce sync.Once
 //
 // The time zone database needed by LoadLocation may not be
 // present on all systems, especially non-Unix systems.
-// LoadLocation looks in the directory or uncompressed zip file
+// LoadLocation looks in the directory, uncompressed zip file, or tzdata file
 // named by the ZONEINFO environment variable, if any, then looks in
 // known installation locations on Unix systems,
 // and finally looks in $GOROOT/lib/time/zoneinfo.zip.
@@ -292,13 +292,13 @@ func LoadLocation(name string) (*Location, error) {
 		env, _ := syscall.Getenv("ZONEINFO")
 		zoneinfo = &env
 	})
-	if zoneinfo != nil && *zoneinfo != "" {
-		if z, err := loadZoneFile(*zoneinfo, name); err == nil {
-			z.name = name
-			return z, nil
-		}
+	sources := zoneSources
+	if *zoneinfo != "" {
+		sources = make([]string, len(zoneSources)+1)
+		sources[0] = *zoneinfo
+		copy(sources[1:], zoneSources)
 	}
-	return loadLocation(name)
+	return loadLocation(name, sources)
 }
 
 // containsDotDot reports whether s contains "..".

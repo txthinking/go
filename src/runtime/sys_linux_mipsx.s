@@ -45,6 +45,7 @@
 #define SYS_epoll_wait		    4250
 #define SYS_clock_gettime	    4263
 #define SYS_epoll_create1	    4326
+#define SYS_brk			    4045
 
 TEXT runtime·exit(SB),NOSPLIT,$0-4
 	MOVW	code+0(FP), R4
@@ -53,12 +54,19 @@ TEXT runtime·exit(SB),NOSPLIT,$0-4
 	UNDEF
 	RET
 
-TEXT runtime·exit1(SB),NOSPLIT,$0-4
-	MOVW	code+0(FP), R4
+// func exitThread(wait *uint32)
+TEXT runtime·exitThread(SB),NOSPLIT,$0-4
+	MOVW	wait+0(FP), R1
+	// We're done using the stack.
+	MOVW	$0, R2
+	SYNC
+	MOVW	R2, (R1)
+	SYNC
+	MOVW	$0, R4	// exit code
 	MOVW	$SYS_exit, R2
 	SYSCALL
 	UNDEF
-	RET
+	JMP	0(PC)
 
 TEXT runtime·open(SB),NOSPLIT,$0-16
 	MOVW	name+0(FP), R4
@@ -271,7 +279,7 @@ TEXT runtime·sigtramp(SB),NOSPLIT,$12
 TEXT runtime·cgoSigtramp(SB),NOSPLIT,$0
 	JMP	runtime·sigtramp(SB)
 
-TEXT runtime·mmap(SB),NOSPLIT,$20-28
+TEXT runtime·mmap(SB),NOSPLIT,$20-32
 	MOVW	addr+0(FP), R4
 	MOVW	n+4(FP), R5
 	MOVW	prot+8(FP), R6
@@ -283,7 +291,13 @@ TEXT runtime·mmap(SB),NOSPLIT,$20-28
 
 	MOVW	$SYS_mmap, R2
 	SYSCALL
-	MOVW	R2, ret+24(FP)
+	BEQ	R7, ok
+	MOVW	$0, p+24(FP)
+	MOVW	R2, err+28(FP)
+	RET
+ok:
+	MOVW	R2, p+24(FP)
+	MOVW	$0, err+28(FP)
 	RET
 
 TEXT runtime·munmap(SB),NOSPLIT,$0-8
@@ -464,4 +478,13 @@ TEXT runtime·closeonexec(SB),NOSPLIT,$0-4
 	MOVW	$1, R6	// FD_CLOEXEC
 	MOVW	$SYS_fcntl, R2
 	SYSCALL
+	RET
+
+// func sbrk0() uintptr
+TEXT runtime·sbrk0(SB),NOSPLIT,$0-4
+	// Implemented as brk(NULL).
+	MOVW	$0, R4
+	MOVW	$SYS_brk, R2
+	SYSCALL
+	MOVW	R2, ret+0(FP)
 	RET

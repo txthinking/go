@@ -17,6 +17,7 @@ import (
 	"go/build"
 	"go/types"
 	"internal/testenv"
+	"io"
 	"log"
 	"os"
 	"os/exec"
@@ -217,6 +218,7 @@ func (p platform) vet() {
 
 	// Process vet output.
 	scan := bufio.NewScanner(stderr)
+	var parseFailed bool
 NextLine:
 	for scan.Scan() {
 		line := scan.Text()
@@ -224,6 +226,15 @@ NextLine:
 			// Typecheck failure: Malformed syntax or multiple packages or the like.
 			// This will yield nicer error messages elsewhere, so ignore them here.
 			continue
+		}
+
+		if strings.HasPrefix(line, "panic: ") {
+			// Panic in vet. Don't filter anything, we want the complete output.
+			parseFailed = true
+			fmt.Fprintf(os.Stderr, "panic in vet (to reproduce: go run main.go -p %s):\n", p)
+			fmt.Fprintln(os.Stderr, line)
+			io.Copy(os.Stderr, stderr)
+			break
 		}
 
 		fields := strings.SplitN(line, ":", 3)
@@ -235,7 +246,11 @@ NextLine:
 		case 3:
 			file, lineno, msg = fields[0], fields[1], fields[2]
 		default:
-			log.Fatalf("could not parse vet output line:\n%s", line)
+			if !parseFailed {
+				parseFailed = true
+				fmt.Fprintf(os.Stderr, "failed to parse %s vet output:\n", p)
+			}
+			fmt.Fprintln(os.Stderr, line)
 		}
 		msg = strings.TrimSpace(msg)
 
@@ -257,6 +272,10 @@ NextLine:
 			continue
 		}
 		w[key]--
+	}
+	if parseFailed {
+		atomic.StoreUint32(&failed, 1)
+		return
 	}
 	if scan.Err() != nil {
 		log.Fatalf("failed to scan vet output: %v", scan.Err())

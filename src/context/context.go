@@ -96,11 +96,11 @@ type Context interface {
 	// a Done channel for cancelation.
 	Done() <-chan struct{}
 
-	// Err returns a non-nil error value after Done is closed. Err returns
-	// Canceled if the context was canceled or DeadlineExceeded if the
-	// context's deadline passed. No other values for Err are defined.
-	// After Done is closed, successive calls to Err return the same value.
-	// Err's return value is unspecified before Done is closed.
+	// If Done is not yet closed, Err returns nil.
+	// If Done is closed, Err returns a non-nil error explaining why:
+	// Canceled if the context was canceled
+	// or DeadlineExceeded if the context's deadline passed.
+	// After Err returns a non-nil error, successive calls to Err return the same error.
 	Err() error
 
 	// Value returns the value associated with this context for key, or nil
@@ -136,7 +136,7 @@ type Context interface {
 	// 	// userKey is the key for user.User values in Contexts. It is
 	// 	// unexported; clients use user.NewContext and user.FromContext
 	// 	// instead of using this key directly.
-	// 	var userKey key = 0
+	// 	var userKey key
 	//
 	// 	// NewContext returns a new Context that carries value u.
 	// 	func NewContext(ctx context.Context, u *User) context.Context {
@@ -380,25 +380,25 @@ func (c *cancelCtx) cancel(removeFromParent bool, err error) {
 //
 // Canceling this context releases resources associated with it, so code should
 // call cancel as soon as the operations running in this Context complete.
-func WithDeadline(parent Context, deadline time.Time) (Context, CancelFunc) {
-	if cur, ok := parent.Deadline(); ok && cur.Before(deadline) {
+func WithDeadline(parent Context, d time.Time) (Context, CancelFunc) {
+	if cur, ok := parent.Deadline(); ok && cur.Before(d) {
 		// The current deadline is already sooner than the new one.
 		return WithCancel(parent)
 	}
 	c := &timerCtx{
 		cancelCtx: newCancelCtx(parent),
-		deadline:  deadline,
+		deadline:  d,
 	}
 	propagateCancel(parent, c)
-	d := time.Until(deadline)
-	if d <= 0 {
+	dur := time.Until(d)
+	if dur <= 0 {
 		c.cancel(true, DeadlineExceeded) // deadline has already passed
 		return c, func() { c.cancel(true, Canceled) }
 	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if c.err == nil {
-		c.timer = time.AfterFunc(d, func() {
+		c.timer = time.AfterFunc(dur, func() {
 			c.cancel(true, DeadlineExceeded)
 		})
 	}

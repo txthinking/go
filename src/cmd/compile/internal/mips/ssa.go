@@ -9,6 +9,7 @@ import (
 
 	"cmd/compile/internal/gc"
 	"cmd/compile/internal/ssa"
+	"cmd/compile/internal/types"
 	"cmd/internal/obj"
 	"cmd/internal/obj/mips"
 )
@@ -24,7 +25,7 @@ func isHILO(r int16) bool {
 }
 
 // loadByType returns the load instruction of the given type.
-func loadByType(t ssa.Type, r int16) obj.As {
+func loadByType(t *types.Type, r int16) obj.As {
 	if isFPreg(r) {
 		if t.Size() == 4 { // float32 or int32
 			return mips.AMOVF
@@ -53,7 +54,7 @@ func loadByType(t ssa.Type, r int16) obj.As {
 }
 
 // storeByType returns the store instruction of the given type.
-func storeByType(t ssa.Type, r int16) obj.As {
+func storeByType(t *types.Type, r int16) obj.As {
 	if isFPreg(r) {
 		if t.Size() == 4 { // float32 or int32
 			return mips.AMOVF
@@ -272,6 +273,7 @@ func ssaGenValue(s *gc.SSAGenState, v *ssa.Value) {
 	case ssa.OpMIPSMOVWaddr:
 		p := s.Prog(mips.AMOVW)
 		p.From.Type = obj.TYPE_ADDR
+		p.From.Reg = v.Args[0].Reg()
 		var wantreg string
 		// MOVW $sym+off(base), R
 		// the assembler expands it as the following:
@@ -281,16 +283,15 @@ func ssaGenValue(s *gc.SSAGenState, v *ssa.Value) {
 		switch v.Aux.(type) {
 		default:
 			v.Fatalf("aux is of unknown type %T", v.Aux)
-		case *ssa.ExternSymbol:
+		case *obj.LSym:
 			wantreg = "SB"
 			gc.AddAux(&p.From, v)
-		case *ssa.ArgSymbol, *ssa.AutoSymbol:
+		case *gc.Node:
 			wantreg = "SP"
 			gc.AddAux(&p.From, v)
 		case nil:
 			// No sym, just MOVW $off(SP), R
 			wantreg = "SP"
-			p.From.Reg = mips.REGSP
 			p.From.Offset = v.AuxInt
 		}
 		if reg := v.Args[0].RegName(); reg != wantreg {
@@ -754,6 +755,16 @@ func ssaGenValue(s *gc.SSAGenState, v *ssa.Value) {
 	case ssa.OpMIPSLoweredGetClosurePtr:
 		// Closure pointer is R22 (mips.REGCTXT).
 		gc.CheckLoweredGetClosurePtr(v)
+	case ssa.OpMIPSLoweredGetCallerSP:
+		// caller's SP is FixedFrameSize below the address of the first arg
+		p := s.Prog(mips.AMOVW)
+		p.From.Type = obj.TYPE_ADDR
+		p.From.Offset = -gc.Ctxt.FixedFrameSize()
+		p.From.Name = obj.NAME_PARAM
+		p.To.Type = obj.TYPE_REG
+		p.To.Reg = v.Reg()
+	case ssa.OpClobber:
+		// TODO: implement for clobberdead experiment. Nop is ok for now.
 	default:
 		v.Fatalf("genValue not implemented: %s", v.LongString())
 	}

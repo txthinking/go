@@ -14,7 +14,8 @@ func Init(arch *gc.Arch) {
 	arch.REGSP = s390x.REGSP
 	arch.MAXWIDTH = 1 << 50
 
-	arch.Defframe = defframe
+	arch.ZeroRange = zerorange
+	arch.ZeroAuto = zeroAuto
 	arch.Ginsnop = ginsnop
 
 	arch.SSAMarkMoves = ssaMarkMoves

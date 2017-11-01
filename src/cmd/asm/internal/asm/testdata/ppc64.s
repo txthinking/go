@@ -6,7 +6,9 @@
 // the old assembler's (9a's) grammar and hand-writing complete
 // instructions for each rule, to guarantee we cover the same space.
 
-TEXT foo(SB),7,$0
+#include "../../../../../runtime/textflag.h"
+
+TEXT foo(SB),DUPOK|NOSPLIT,$0
 
 //inst:
 //
@@ -22,7 +24,7 @@ TEXT foo(SB),7,$0
 //	{
 //		outcode(int($1), &$2, 0, &$4);
 //	}
-	MOVW	foo<>+3(SB), R2
+	MOVW	foo<>+4(SB), R2
 	MOVW	16(R1), R2
 
 //	LMOVW regaddr ',' rreg
@@ -59,7 +61,7 @@ TEXT foo(SB),7,$0
 //	{
 //		outcode(int($1), &$2, 0, &$4);
 //	}
-	FMOVD	foo<>+3(SB), F2
+	FMOVD	foo<>+4(SB), F2
 	FMOVD	16(R1), F2
 
 //	LFMOV regaddr ',' freg
@@ -84,7 +86,7 @@ TEXT foo(SB),7,$0
 //	{
 //		outcode(int($1), &$2, 0, &$4);
 //	}
-	FMOVD	F2, foo<>+3(SB)
+	FMOVD	F2, foo<>+4(SB)
 	FMOVD	F2, 16(R1)
 
 //	LFMOV freg ',' regaddr
@@ -130,7 +132,7 @@ TEXT foo(SB),7,$0
 //	{
 //		outcode(int($1), &$2, 0, &$4);
 //	}
-	FMOVD	F1, foo<>+3(SB)
+	FMOVD	F1, foo<>+4(SB)
 	FMOVD	F1, 16(R2)
 
 //	LMOVW freg ',' regaddr
@@ -548,6 +550,14 @@ label1:
 //	ftsqrt	BF, FRB
 	FTSQRT	F2,$7
 
+//	FCFID	
+//	FCFIDS
+
+	FCFID	F2,F3
+	FCFIDCC	F3,F3
+	FCFIDS	F2,F3
+	FCFIDSCC F2,F3
+
 //
 // CMP
 //
@@ -578,6 +588,19 @@ label1:
 //	CMPB  RS,RB,RA produces
 //	cmpb  RA,RS,RB
 	CMPB  R2,R2,R1
+
+//	CMPEQB	RA,RB,BF produces
+//	cmpeqb	BF,RA,RB
+	CMPEQB	R1, R2, CR0
+
+//
+// rotate extended mnemonics map onto other shift instructions
+//
+
+	ROTL	$12,R2,R3
+	ROTL	R2,R3,R4
+	ROTLW	$9,R2,R3
+	ROTLW	R2,R3,R4
 
 //
 // rotate and mask
@@ -614,6 +637,17 @@ label1:
 	RLDICL	$1, R2, $61, R6
 
 	RLDIMI  $7, R2, $52, R7
+
+// opcodes for right and left shifts, const and reg shift counts
+
+	SLD	$4, R3, R4
+	SLD	R2, R3, R4
+	SLW	$4, R3, R4
+	SLW	R2, R3, R4
+	SRD	$8, R3, R4
+	SRD	R2, R3, R4
+	SRW	$8, R3, R4
+	SRW	R2, R3, R4
 
 //
 // load/store multiple
@@ -684,6 +718,14 @@ label1:
 //	}
 	DCBF	(R1)
 	DCBF	(R1+R2) // DCBF	(R1)(R2*1)
+	DCBF	(R1), $1
+	DCBF	(R1)(R2*1), $1
+	DCBT	(R1), $1
+	DCBT	(R1)(R2*1), $1
+
+//	LDMX  (RB)(RA*1),RT produces
+//	ldmx  RT,RA,RB
+	LDMX  (R2)(R1*1), R3
 
 //	Population count, X-form
 //	<MNEMONIC> RS,RA produces
@@ -691,6 +733,20 @@ label1:
 	POPCNTD	R1,R2
 	POPCNTW	R1,R2
 	POPCNTB R1,R2
+
+//	Copysign
+	FCPSGN F1,F2,F3
+
+//	Random number generator, X-form
+//	DARN  L,RT produces
+//	darn  RT,L
+	DARN $1, R1
+
+//	Copy/Paste facility
+//	<MNEMONIC> RB,RA produces
+//	<mnemonic> RA,RB
+	COPY R2,R1
+	PASTECC R2,R1
 
 //	VMX instructions
 
@@ -765,6 +821,11 @@ label1:
 	VPMSUMH	V2, V3, V1
 	VPMSUMW	V2, V3, V1
 	VPMSUMD	V2, V3, V1
+
+//	Vector multiply-sum, VA-form
+//	<MNEMONIC> VRA, VRB, VRC, VRT produces
+//	<mnemonic> VRT, VRA, VRB, VRC
+	VMSUMUDM V4, V3, V2, V1
 
 //	Vector SUB, VX-form
 //	<MNEMONIC> VRA,VRB,VRT produces
@@ -863,6 +924,8 @@ label1:
 	VCMPGTSWCC  V3, V2, V1
 	VCMPGTSD    V3, V2, V1
 	VCMPGTSDCC  V3, V2, V1
+	VCMPNEZB    V3, V2, V1
+	VCMPNEZBCC  V3, V2, V1
 
 //	Vector permute, VA-form
 //	<MNEMONIC> VRA,VRB,VRC,VRT produces
@@ -936,6 +999,7 @@ label1:
 //	<mnemonic> RA,XS
 	MFVSRD	    VS0, R1
 	MFVSRWZ	    VS33, R1
+	MFVSRLD	    VS63, R1
 
 //	VSX move to VSR, XX1-form
 //	<MNEMONIC> RA,XT produces
@@ -943,6 +1007,8 @@ label1:
 	MTVSRD	    R1, VS0
 	MTVSRWA	    R1, VS31
 	MTVSRWZ	    R1, VS63
+	MTVSRDD	    R1, R2, VS0
+	MTVSRWS	    R1, VS32
 
 //	VSX AND, XX3-form
 //	<MNEMONIC> XA,XB,XT produces
@@ -1039,6 +1105,17 @@ label1:
 	XVCVSXWSP   VS0,VS32
 	XVCVUXDSP   VS0,VS32
 	XVCVUXWSP   VS0,VS32
+
+// Multiply-Add High Doubleword
+//      <MNEMONIC> RA,RB,RC,RT produces
+//      <mnemonic> RT,RA,RB,RC
+        MADDHD R1,R2,R3,R4
+        MADDHDU R1,R2,R3,R4
+
+// Add Extended using alternate carry bit
+//	ADDEX RA,RB,CY,RT produces
+//	addex RT, RA, RB, CY
+	ADDEX R1, R2, $0, R3
 
 //
 // NOP

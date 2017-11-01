@@ -6,6 +6,7 @@ package gc
 
 import (
 	"cmd/compile/internal/ssa"
+	"cmd/compile/internal/types"
 	"cmd/internal/src"
 	"container/heap"
 	"fmt"
@@ -71,7 +72,7 @@ func (s *phiState) insertPhis() {
 	// Generate a numbering for these variables.
 	s.varnum = map[*Node]int32{}
 	var vars []*Node
-	var vartypes []ssa.Type
+	var vartypes []*types.Type
 	for _, b := range s.f.Blocks {
 		for _, v := range b.Values {
 			if v.Op != ssa.OpFwdRef {
@@ -162,7 +163,7 @@ levels:
 	s.queued = newSparseSet(s.f.NumBlocks())
 	s.hasPhi = newSparseSet(s.f.NumBlocks())
 	s.hasDef = newSparseSet(s.f.NumBlocks())
-	s.placeholder = s.s.entryNewValue0(ssa.OpUnknown, ssa.TypeInvalid)
+	s.placeholder = s.s.entryNewValue0(ssa.OpUnknown, types.TypeInvalid)
 
 	// Generate phi ops for each variable.
 	for n := range vartypes {
@@ -182,7 +183,7 @@ levels:
 	}
 }
 
-func (s *phiState) insertVarPhis(n int, var_ *Node, defs []*ssa.Block, typ ssa.Type) {
+func (s *phiState) insertVarPhis(n int, var_ *Node, defs []*ssa.Block, typ *types.Type) {
 	priq := &s.priq
 	q := s.q
 	queued := s.queued
@@ -232,24 +233,25 @@ func (s *phiState) insertVarPhis(n int, var_ *Node, defs []*ssa.Block, typ ssa.T
 					// a D-edge, or an edge whose target is in currentRoot's subtree.
 					continue
 				}
-				if !hasPhi.contains(c.ID) {
-					// Add a phi to block c for variable n.
-					hasPhi.add(c.ID)
-					v := c.NewValue0I(currentRoot.Pos, ssa.OpPhi, typ, int64(n)) // TODO: line number right?
-					// Note: we store the variable number in the phi's AuxInt field. Used temporarily by phi building.
-					s.s.addNamedValue(var_, v)
-					for i := 0; i < len(c.Preds); i++ {
-						v.AddArg(s.placeholder) // Actual args will be filled in by resolveFwdRefs.
-					}
-					if debugPhi {
-						fmt.Printf("new phi for var%d in %s: %s\n", n, c, v)
-					}
-					if !hasDef.contains(c.ID) {
-						// There's now a new definition of this variable in block c.
-						// Add it to the priority queue to explore.
-						heap.Push(priq, c)
-						hasDef.add(c.ID)
-					}
+				if hasPhi.contains(c.ID) {
+					continue
+				}
+				// Add a phi to block c for variable n.
+				hasPhi.add(c.ID)
+				v := c.NewValue0I(currentRoot.Pos, ssa.OpPhi, typ, int64(n)) // TODO: line number right?
+				// Note: we store the variable number in the phi's AuxInt field. Used temporarily by phi building.
+				s.s.addNamedValue(var_, v)
+				for i := 0; i < len(c.Preds); i++ {
+					v.AddArg(s.placeholder) // Actual args will be filled in by resolveFwdRefs.
+				}
+				if debugPhi {
+					fmt.Printf("new phi for var%d in %s: %s\n", n, c, v)
+				}
+				if !hasDef.contains(c.ID) {
+					// There's now a new definition of this variable in block c.
+					// Add it to the priority queue to explore.
+					heap.Push(priq, c)
+					hasDef.add(c.ID)
 				}
 			}
 
@@ -430,14 +432,15 @@ func (s *sparseSet) clear() {
 
 // Variant to use for small functions.
 type simplePhiState struct {
-	s       *state                 // SSA state
-	f       *ssa.Func              // function to work on
-	fwdrefs []*ssa.Value           // list of FwdRefs to be processed
-	defvars []map[*Node]*ssa.Value // defined variables at end of each block
+	s         *state                 // SSA state
+	f         *ssa.Func              // function to work on
+	fwdrefs   []*ssa.Value           // list of FwdRefs to be processed
+	defvars   []map[*Node]*ssa.Value // defined variables at end of each block
+	reachable []bool                 // which blocks are reachable
 }
 
 func (s *simplePhiState) insertPhis() {
-	reachable := ssa.ReachableBlocks(s.f)
+	s.reachable = ssa.ReachableBlocks(s.f)
 
 	// Find FwdRef ops.
 	for _, b := range s.f.Blocks {
@@ -465,7 +468,7 @@ loop:
 			// No variable should be live at entry.
 			s.s.Fatalf("Value live at entry. It shouldn't be. func %s, node %v, value %v", s.f.Name, var_, v)
 		}
-		if !reachable[b.ID] {
+		if !s.reachable[b.ID] {
 			// This block is dead.
 			// It doesn't matter what we use here as long as it is well-formed.
 			v.Op = ssa.OpUnknown
@@ -508,7 +511,7 @@ loop:
 }
 
 // lookupVarOutgoing finds the variable's value at the end of block b.
-func (s *simplePhiState) lookupVarOutgoing(b *ssa.Block, t ssa.Type, var_ *Node, line src.XPos) *ssa.Value {
+func (s *simplePhiState) lookupVarOutgoing(b *ssa.Block, t *types.Type, var_ *Node, line src.XPos) *ssa.Value {
 	for {
 		if v := s.defvars[b.ID][var_]; v != nil {
 			return v
@@ -520,6 +523,11 @@ func (s *simplePhiState) lookupVarOutgoing(b *ssa.Block, t ssa.Type, var_ *Node,
 			break
 		}
 		b = b.Preds[0].Block()
+		if !s.reachable[b.ID] {
+			// This is rare; it happens with oddly interleaved infinite loops in dead code.
+			// See issue 19783.
+			break
+		}
 	}
 	// Generate a FwdRef for the variable and return that.
 	v := b.NewValue0A(line, ssa.OpFwdRef, t, var_)

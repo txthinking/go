@@ -174,6 +174,45 @@ func TestStat(t *testing.T) {
 	}
 }
 
+func TestStatError(t *testing.T) {
+	defer chtmpdir(t)()
+
+	path := "no-such-file"
+	Remove(path) // Just in case
+
+	fi, err := Stat(path)
+	if err == nil {
+		t.Fatal("got nil, want error")
+	}
+	if fi != nil {
+		t.Errorf("got %v, want nil", fi)
+	}
+	if perr, ok := err.(*PathError); !ok {
+		t.Errorf("got %T, want %T", err, perr)
+	}
+
+	testenv.MustHaveSymlink(t)
+
+	link := "symlink"
+	Remove(link) // Just in case
+	err = Symlink(path, link)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer Remove(link)
+
+	fi, err = Stat(link)
+	if err == nil {
+		t.Fatal("got nil, want error")
+	}
+	if fi != nil {
+		t.Errorf("got %v, want nil", fi)
+	}
+	if perr, ok := err.(*PathError); !ok {
+		t.Errorf("got %T, want %T", err, perr)
+	}
+}
+
 func TestFstat(t *testing.T) {
 	path := sfdir + "/" + sfname
 	file, err1 := Open(path)
@@ -357,6 +396,50 @@ func BenchmarkReaddirname(b *testing.B) {
 
 func BenchmarkReaddir(b *testing.B) {
 	benchmarkReaddir(".", b)
+}
+
+func benchmarkStat(b *testing.B, path string) {
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		_, err := Stat(path)
+		if err != nil {
+			b.Fatalf("Stat(%q) failed: %v", path, err)
+		}
+	}
+}
+
+func benchmarkLstat(b *testing.B, path string) {
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		_, err := Lstat(path)
+		if err != nil {
+			b.Fatalf("Lstat(%q) failed: %v", path, err)
+		}
+	}
+}
+
+func BenchmarkStatDot(b *testing.B) {
+	benchmarkStat(b, ".")
+}
+
+func BenchmarkStatFile(b *testing.B) {
+	benchmarkStat(b, filepath.Join(runtime.GOROOT(), "src/os/os_test.go"))
+}
+
+func BenchmarkStatDir(b *testing.B) {
+	benchmarkStat(b, filepath.Join(runtime.GOROOT(), "src/os"))
+}
+
+func BenchmarkLstatDot(b *testing.B) {
+	benchmarkLstat(b, ".")
+}
+
+func BenchmarkLstatFile(b *testing.B) {
+	benchmarkLstat(b, filepath.Join(runtime.GOROOT(), "src/os/os_test.go"))
+}
+
+func BenchmarkLstatDir(b *testing.B) {
+	benchmarkLstat(b, filepath.Join(runtime.GOROOT(), "src/os"))
 }
 
 // Read the directory one entry at a time.
@@ -673,55 +756,58 @@ func TestSymlink(t *testing.T) {
 	Remove(from) // Just in case.
 	file, err := Create(to)
 	if err != nil {
-		t.Fatalf("open %q failed: %v", to, err)
+		t.Fatalf("Create(%q) failed: %v", to, err)
 	}
 	defer Remove(to)
 	if err = file.Close(); err != nil {
-		t.Errorf("close %q failed: %v", to, err)
+		t.Errorf("Close(%q) failed: %v", to, err)
 	}
 	err = Symlink(to, from)
 	if err != nil {
-		t.Fatalf("symlink %q, %q failed: %v", to, from, err)
+		t.Fatalf("Symlink(%q, %q) failed: %v", to, from, err)
 	}
 	defer Remove(from)
 	tostat, err := Lstat(to)
 	if err != nil {
-		t.Fatalf("stat %q failed: %v", to, err)
+		t.Fatalf("Lstat(%q) failed: %v", to, err)
 	}
 	if tostat.Mode()&ModeSymlink != 0 {
-		t.Fatalf("stat %q claims to have found a symlink", to)
+		t.Fatalf("Lstat(%q).Mode()&ModeSymlink = %v, want 0", to, tostat.Mode()&ModeSymlink)
 	}
 	fromstat, err := Stat(from)
 	if err != nil {
-		t.Fatalf("stat %q failed: %v", from, err)
+		t.Fatalf("Stat(%q) failed: %v", from, err)
 	}
 	if !SameFile(tostat, fromstat) {
-		t.Errorf("symlink %q, %q did not create symlink", to, from)
+		t.Errorf("Symlink(%q, %q) did not create symlink", to, from)
 	}
 	fromstat, err = Lstat(from)
 	if err != nil {
-		t.Fatalf("lstat %q failed: %v", from, err)
+		t.Fatalf("Lstat(%q) failed: %v", from, err)
 	}
 	if fromstat.Mode()&ModeSymlink == 0 {
-		t.Fatalf("symlink %q, %q did not create symlink", to, from)
+		t.Fatalf("Lstat(%q).Mode()&ModeSymlink = 0, want %v", from, ModeSymlink)
 	}
 	fromstat, err = Stat(from)
 	if err != nil {
-		t.Fatalf("stat %q failed: %v", from, err)
+		t.Fatalf("Stat(%q) failed: %v", from, err)
+	}
+	if fromstat.Name() != from {
+		t.Errorf("Stat(%q).Name() = %q, want %q", from, fromstat.Name(), from)
 	}
 	if fromstat.Mode()&ModeSymlink != 0 {
-		t.Fatalf("stat %q did not follow symlink", from)
+		t.Fatalf("Stat(%q).Mode()&ModeSymlink = %v, want 0", from, fromstat.Mode()&ModeSymlink)
 	}
 	s, err := Readlink(from)
 	if err != nil {
-		t.Fatalf("readlink %q failed: %v", from, err)
+		t.Fatalf("Readlink(%q) failed: %v", from, err)
 	}
 	if s != to {
-		t.Fatalf("after symlink %q != %q", s, to)
+		t.Fatalf("Readlink(%q) = %q, want %q", from, s, to)
 	}
 	file, err = Open(from)
 	if err != nil {
-		t.Fatalf("open %q failed: %v", from, err)
+		t.Fatalf("Open(%q) failed: %v", from, err)
 	}
 	file.Close()
 }
@@ -844,6 +930,18 @@ func TestRenameFailed(t *testing.T) {
 	}
 }
 
+func TestRenameNotExisting(t *testing.T) {
+	defer chtmpdir(t)()
+	from, to := "doesnt-exist", "dest"
+
+	Mkdir(to, 0777)
+	defer Remove(to)
+
+	if err := Rename(from, to); !IsNotExist(err) {
+		t.Errorf("Rename(%q, %q) = %v; want an IsNotExist error", from, to, err)
+	}
+}
+
 func TestRenameToDirFailed(t *testing.T) {
 	defer chtmpdir(t)()
 	from, to := "renamefrom", "renameto"
@@ -916,9 +1014,14 @@ func TestStartProcess(t *testing.T) {
 		dir = Getenv("SystemRoot")
 		args = []string{"/c", "cd"}
 	default:
-		cmd = "/bin/pwd"
+		var err error
+		cmd, err = osexec.LookPath("pwd")
+		if err != nil {
+			t.Fatalf("Can't find pwd: %v", err)
+		}
 		dir = "/"
 		args = []string{}
+		t.Logf("Testing with %v", cmd)
 	}
 	cmddir, cmdbase := filepath.Split(cmd)
 	args = append([]string{cmdbase}, args...)
@@ -1247,6 +1350,32 @@ func TestSeek(t *testing.T) {
 	}
 }
 
+func TestSeekError(t *testing.T) {
+	switch runtime.GOOS {
+	case "plan9", "nacl":
+		t.Skipf("skipping test on %v", runtime.GOOS)
+	}
+
+	r, w, err := Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = r.Seek(0, 0)
+	if err == nil {
+		t.Fatal("Seek on pipe should fail")
+	}
+	if perr, ok := err.(*PathError); !ok || perr.Err != syscall.ESPIPE {
+		t.Errorf("Seek returned error %v, want &PathError{Err: syscall.ESPIPE}", err)
+	}
+	_, err = w.Seek(0, 0)
+	if err == nil {
+		t.Fatal("Seek on pipe should fail")
+	}
+	if perr, ok := err.(*PathError); !ok || perr.Err != syscall.ESPIPE {
+		t.Errorf("Seek returned error %v, want &PathError{Err: syscall.ESPIPE}", err)
+	}
+}
+
 type openErrorTest struct {
 	path  string
 	mode  int
@@ -1451,6 +1580,26 @@ func TestReadAtOffset(t *testing.T) {
 	}
 }
 
+// Verify that ReadAt doesn't allow negative offset.
+func TestReadAtNegativeOffset(t *testing.T) {
+	f := newFile("TestReadAtNegativeOffset", t)
+	defer Remove(f.Name())
+	defer f.Close()
+
+	const data = "hello, world\n"
+	io.WriteString(f, data)
+
+	f.Seek(0, 0)
+	b := make([]byte, 5)
+
+	n, err := f.ReadAt(b, -10)
+
+	const wantsub = "negative offset"
+	if !strings.Contains(fmt.Sprint(err), wantsub) || n != 0 {
+		t.Errorf("ReadAt(-10) = %v, %v; want 0, ...%q...", n, err, wantsub)
+	}
+}
+
 func TestWriteAt(t *testing.T) {
 	f := newFile("TestWriteAt", t)
 	defer Remove(f.Name())
@@ -1470,6 +1619,20 @@ func TestWriteAt(t *testing.T) {
 	}
 	if string(b) != "hello, WORLD\n" {
 		t.Fatalf("after write: have %q want %q", string(b), "hello, WORLD\n")
+	}
+}
+
+// Verify that WriteAt doesn't allow negative offset.
+func TestWriteAtNegativeOffset(t *testing.T) {
+	f := newFile("TestWriteAtNegativeOffset", t)
+	defer Remove(f.Name())
+	defer f.Close()
+
+	n, err := f.WriteAt([]byte("WORLD"), -10)
+
+	const wantsub = "negative offset"
+	if !strings.Contains(fmt.Sprint(err), wantsub) || n != 0 {
+		t.Errorf("WriteAt(-10) = %v, %v; want 0, ...%q...", n, err, wantsub)
 	}
 }
 
@@ -1705,6 +1868,60 @@ func TestStatStdin(t *testing.T) {
 	}
 }
 
+func TestStatRelativeSymlink(t *testing.T) {
+	testenv.MustHaveSymlink(t)
+
+	tmpdir, err := ioutil.TempDir("", "TestStatRelativeSymlink")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer RemoveAll(tmpdir)
+
+	target := filepath.Join(tmpdir, "target")
+	f, err := Create(target)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close()
+
+	st, err := f.Stat()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	link := filepath.Join(tmpdir, "link")
+	err = Symlink(filepath.Base(target), link)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	st1, err := Stat(link)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if !SameFile(st, st1) {
+		t.Error("Stat doesn't follow relative symlink")
+	}
+
+	if runtime.GOOS == "windows" {
+		Remove(link)
+		err = Symlink(target[len(filepath.VolumeName(target)):], link)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		st1, err := Stat(link)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		if !SameFile(st, st1) {
+			t.Error("Stat doesn't follow relative symlink")
+		}
+	}
+}
+
 func TestReadAtEOF(t *testing.T) {
 	f := newFile("TestReadAtEOF", t)
 	defer Remove(f.Name())
@@ -1777,6 +1994,10 @@ func TestLongPath(t *testing.T) {
 					filesize := size(path, t)
 					if dir.Size() != filesize || filesize != wantSize {
 						t.Errorf("Size(%q) is %d, len(ReadFile()) is %d, want %d", path, dir.Size(), filesize, wantSize)
+					}
+					err = Chmod(path, dir.Mode())
+					if err != nil {
+						t.Fatalf("Chmod(%q) failed: %v", path, err)
 					}
 				}
 				if err := Truncate(sizedTempDir+"/bar.txt", 0); err != nil {
@@ -1984,22 +2205,24 @@ func TestPipeThreads(t *testing.T) {
 
 	defer debug.SetMaxThreads(debug.SetMaxThreads(threads / 2))
 
-	var wg sync.WaitGroup
-	wg.Add(threads)
-	c := make(chan bool, threads)
+	creading := make(chan bool, threads)
+	cdone := make(chan bool, threads)
 	for i := 0; i < threads; i++ {
 		go func(i int) {
-			defer wg.Done()
 			var b [1]byte
-			c <- true
+			creading <- true
 			if _, err := r[i].Read(b[:]); err != nil {
 				t.Error(err)
 			}
+			if err := r[i].Close(); err != nil {
+				t.Error(err)
+			}
+			cdone <- true
 		}(i)
 	}
 
 	for i := 0; i < threads; i++ {
-		<-c
+		<-creading
 	}
 
 	// If we are still alive, it means that the 100 goroutines did
@@ -2012,13 +2235,26 @@ func TestPipeThreads(t *testing.T) {
 		if err := w[i].Close(); err != nil {
 			t.Error(err)
 		}
+		<-cdone
 	}
+}
 
-	wg.Wait()
-
-	for i := 0; i < threads; i++ {
-		if err := r[i].Close(); err != nil {
-			t.Error(err)
-		}
+func TestDoubleCloseError(t *testing.T) {
+	path := sfdir + "/" + sfname
+	file, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := file.Close(); err != nil {
+		t.Fatalf("unexpected error from Close: %v", err)
+	}
+	if err := file.Close(); err == nil {
+		t.Error("second Close did not fail")
+	} else if pe, ok := err.(*PathError); !ok {
+		t.Errorf("second Close returned unexpected error type %T; expected os.PathError", pe)
+	} else if pe.Err != ErrClosed {
+		t.Errorf("second Close returned %q, wanted %q", err, ErrClosed)
+	} else {
+		t.Logf("second close returned expected error %q", err)
 	}
 }

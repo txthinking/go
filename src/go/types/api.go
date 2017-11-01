@@ -24,7 +24,7 @@
 //
 // For a tutorial, see https://golang.org/s/types-tutorial.
 //
-package types // import "go/types"
+package types
 
 import (
 	"bytes"
@@ -176,11 +176,11 @@ type Info struct {
 	// Implicits maps nodes to their implicitly declared objects, if any.
 	// The following node and object types may appear:
 	//
-	//	node               declared object
+	//     node               declared object
 	//
-	//	*ast.ImportSpec    *PkgName for dot-imports and imports without renames
-	//	*ast.CaseClause    type-specific *Var for each type switch case clause (incl. default)
-	//      *ast.Field         anonymous parameter *Var
+	//     *ast.ImportSpec    *PkgName for imports without renames
+	//     *ast.CaseClause    type-specific *Var for each type switch case clause (incl. default)
+	//     *ast.Field         anonymous parameter *Var
 	//
 	Implicits map[ast.Node]Object
 
@@ -200,16 +200,16 @@ type Info struct {
 	//
 	// The following node types may appear in Scopes:
 	//
-	//	*ast.File
-	//	*ast.FuncType
-	//	*ast.BlockStmt
-	//	*ast.IfStmt
-	//	*ast.SwitchStmt
-	//	*ast.TypeSwitchStmt
-	//	*ast.CaseClause
-	//	*ast.CommClause
-	//	*ast.ForStmt
-	//	*ast.RangeStmt
+	//     *ast.File
+	//     *ast.FuncType
+	//     *ast.BlockStmt
+	//     *ast.IfStmt
+	//     *ast.SwitchStmt
+	//     *ast.TypeSwitchStmt
+	//     *ast.CaseClause
+	//     *ast.CommClause
+	//     *ast.ForStmt
+	//     *ast.RangeStmt
 	//
 	Scopes map[ast.Node]*Scope
 
@@ -245,7 +245,7 @@ func (info *Info) TypeOf(e ast.Expr) Type {
 // Precondition: the Uses and Defs maps are populated.
 //
 func (info *Info) ObjectOf(id *ast.Ident) Object {
-	if obj, _ := info.Defs[id]; obj != nil {
+	if obj := info.Defs[id]; obj != nil {
 		return obj
 	}
 	return info.Uses[id]

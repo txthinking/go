@@ -17,17 +17,20 @@ import (
 )
 
 var (
-	DefaultUserAgent             = defaultUserAgent
-	NewLoggingConn               = newLoggingConn
-	ExportAppendTime             = appendTime
-	ExportRefererForURL          = refererForURL
-	ExportServerNewConn          = (*Server).newConn
-	ExportCloseWriteAndWait      = (*conn).closeWriteAndWait
-	ExportErrRequestCanceled     = errRequestCanceled
-	ExportErrRequestCanceledConn = errRequestCanceledConn
-	ExportServeFile              = serveFile
-	ExportScanETag               = scanETag
-	ExportHttp2ConfigureServer   = http2ConfigureServer
+	DefaultUserAgent                  = defaultUserAgent
+	NewLoggingConn                    = newLoggingConn
+	ExportAppendTime                  = appendTime
+	ExportRefererForURL               = refererForURL
+	ExportServerNewConn               = (*Server).newConn
+	ExportCloseWriteAndWait           = (*conn).closeWriteAndWait
+	ExportErrRequestCanceled          = errRequestCanceled
+	ExportErrRequestCanceledConn      = errRequestCanceledConn
+	ExportErrServerClosedIdle         = errServerClosedIdle
+	ExportServeFile                   = serveFile
+	ExportScanETag                    = scanETag
+	ExportHttp2ConfigureServer        = http2ConfigureServer
+	Export_shouldCopyHeaderOnRedirect = shouldCopyHeaderOnRedirect
+	Export_writeStatusLine            = writeStatusLine
 )
 
 func init() {
@@ -60,9 +63,14 @@ func SetPendingDialHooks(before, after func()) {
 func SetTestHookServerServe(fn func(*Server, net.Listener)) { testHookServerServe = fn }
 
 func NewTestTimeoutHandler(handler Handler, ch <-chan time.Time) Handler {
+	ctx, cancel := context.WithCancel(context.Background())
+	go func() {
+		<-ch
+		cancel()
+	}()
 	return &timeoutHandler{
 		handler:     handler,
-		testTimeout: ch,
+		testContext: ctx,
 		// (no body)
 	}
 }
@@ -187,8 +195,6 @@ func ExportHttp2ConfigureTransport(t *Transport) error {
 	t.h2transport = t2
 	return nil
 }
-
-var Export_shouldCopyHeaderOnRedirect = shouldCopyHeaderOnRedirect
 
 func (s *Server) ExportAllConnsIdle() bool {
 	s.mu.Lock()

@@ -6,7 +6,10 @@
 
 package testdata
 
-import "unsafe"
+import (
+	"fmt"
+	"unsafe"
+)
 
 func ShiftTest() {
 	var i8 int8
@@ -106,4 +109,54 @@ func ShiftTest() {
 	h <<= 8 * unsafe.Sizeof(h) // ERROR "too small for shift"
 	h >>= 7 * unsafe.Alignof(h)
 	h >>= 8 * unsafe.Alignof(h) // ERROR "too small for shift"
+}
+
+func ShiftDeadCode() {
+	var i int
+	const iBits = 8 * unsafe.Sizeof(i)
+
+	if iBits <= 32 {
+		if iBits == 16 {
+			_ = i >> 8
+		} else {
+			_ = i >> 16
+		}
+	} else {
+		_ = i >> 32
+	}
+
+	if iBits >= 64 {
+		_ = i << 32
+		if iBits == 128 {
+			_ = i << 64
+		}
+	} else {
+		_ = i << 16
+	}
+
+	if iBits == 64 {
+		_ = i << 32
+	}
+
+	switch iBits {
+	case 128, 64:
+		_ = i << 32
+	default:
+		_ = i << 16
+	}
+
+	switch {
+	case iBits < 32:
+		_ = i << 16
+	case iBits > 64:
+		_ = i << 64
+	default:
+		_ = i << 64 // ERROR "too small for shift"
+	}
+
+	// Make sure other vet checks work in dead code.
+	if iBits == 1024 {
+		_ = i << 512                  // OK
+		fmt.Printf("foo %s bar", 123) // ERROR "Printf"
+	}
 }

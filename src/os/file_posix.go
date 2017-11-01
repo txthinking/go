@@ -7,7 +7,6 @@
 package os
 
 import (
-	"runtime"
 	"syscall"
 	"time"
 )
@@ -45,32 +44,31 @@ func syscallMode(i FileMode) (o uint32) {
 	return
 }
 
-// Chmod changes the mode of the named file to mode.
-// If the file is a symbolic link, it changes the mode of the link's target.
-// If there is an error, it will be of type *PathError.
-func Chmod(name string, mode FileMode) error {
-	if e := syscall.Chmod(name, syscallMode(mode)); e != nil {
+// See docs in file.go:Chmod.
+func chmod(name string, mode FileMode) error {
+	if e := syscall.Chmod(fixLongPath(name), syscallMode(mode)); e != nil {
 		return &PathError{"chmod", name, e}
 	}
 	return nil
 }
 
-// Chmod changes the mode of the file to mode.
-// If there is an error, it will be of type *PathError.
-func (f *File) Chmod(mode FileMode) error {
+// See docs in file.go:(*File).Chmod.
+func (f *File) chmod(mode FileMode) error {
 	if err := f.checkValid("chmod"); err != nil {
 		return err
 	}
 	if e := f.pfd.Fchmod(syscallMode(mode)); e != nil {
-		return &PathError{"chmod", f.name, e}
+		return f.wrapErr("chmod", e)
 	}
-	runtime.KeepAlive(f)
 	return nil
 }
 
 // Chown changes the numeric uid and gid of the named file.
 // If the file is a symbolic link, it changes the uid and gid of the link's target.
 // If there is an error, it will be of type *PathError.
+//
+// On Windows, it always returns the syscall.EWINDOWS error, wrapped
+// in *PathError.
 func Chown(name string, uid, gid int) error {
 	if e := syscall.Chown(name, uid, gid); e != nil {
 		return &PathError{"chown", name, e}
@@ -81,6 +79,9 @@ func Chown(name string, uid, gid int) error {
 // Lchown changes the numeric uid and gid of the named file.
 // If the file is a symbolic link, it changes the uid and gid of the link itself.
 // If there is an error, it will be of type *PathError.
+//
+// On Windows, it always returns the syscall.EWINDOWS error, wrapped
+// in *PathError.
 func Lchown(name string, uid, gid int) error {
 	if e := syscall.Lchown(name, uid, gid); e != nil {
 		return &PathError{"lchown", name, e}
@@ -90,14 +91,16 @@ func Lchown(name string, uid, gid int) error {
 
 // Chown changes the numeric uid and gid of the named file.
 // If there is an error, it will be of type *PathError.
+//
+// On Windows, it always returns the syscall.EWINDOWS error, wrapped
+// in *PathError.
 func (f *File) Chown(uid, gid int) error {
 	if err := f.checkValid("chown"); err != nil {
 		return err
 	}
 	if e := f.pfd.Fchown(uid, gid); e != nil {
-		return &PathError{"chown", f.name, e}
+		return f.wrapErr("chown", e)
 	}
-	runtime.KeepAlive(f)
 	return nil
 }
 
@@ -109,9 +112,8 @@ func (f *File) Truncate(size int64) error {
 		return err
 	}
 	if e := f.pfd.Ftruncate(size); e != nil {
-		return &PathError{"truncate", f.name, e}
+		return f.wrapErr("truncate", e)
 	}
-	runtime.KeepAlive(f)
 	return nil
 }
 
@@ -123,9 +125,8 @@ func (f *File) Sync() error {
 		return err
 	}
 	if e := f.pfd.Fsync(); e != nil {
-		return &PathError{"sync", f.name, e}
+		return f.wrapErr("sync", e)
 	}
-	runtime.KeepAlive(f)
 	return nil
 }
 
@@ -153,10 +154,33 @@ func (f *File) Chdir() error {
 		return err
 	}
 	if e := f.pfd.Fchdir(); e != nil {
-		return &PathError{"chdir", f.name, e}
+		return f.wrapErr("chdir", e)
 	}
-	runtime.KeepAlive(f)
 	return nil
+}
+
+// setDeadline sets the read and write deadline.
+func (f *File) setDeadline(t time.Time) error {
+	if err := f.checkValid("SetDeadline"); err != nil {
+		return err
+	}
+	return f.pfd.SetDeadline(t)
+}
+
+// setReadDeadline sets the read deadline.
+func (f *File) setReadDeadline(t time.Time) error {
+	if err := f.checkValid("SetReadDeadline"); err != nil {
+		return err
+	}
+	return f.pfd.SetReadDeadline(t)
+}
+
+// setWriteDeadline sets the write deadline.
+func (f *File) setWriteDeadline(t time.Time) error {
+	if err := f.checkValid("SetWriteDeadline"); err != nil {
+		return err
+	}
+	return f.pfd.SetWriteDeadline(t)
 }
 
 // checkValid checks whether f is valid for use.
@@ -164,9 +188,6 @@ func (f *File) Chdir() error {
 func (f *File) checkValid(op string) error {
 	if f == nil {
 		return ErrInvalid
-	}
-	if f.pfd.Sysfd == badFd {
-		return &PathError{op, f.name, ErrClosed}
 	}
 	return nil
 }

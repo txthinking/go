@@ -116,14 +116,17 @@ const (
 	C_REGREG
 	C_REGREG2
 	C_REGLIST
-	C_SHIFT
+	C_SHIFT     /* register shift R>>x */
+	C_SHIFTADDR /* memory address with shifted offset R>>x(R) */
 	C_FREG
 	C_PSR
 	C_FCR
 
-	C_RCON /* 0xff rotated */
-	C_NCON /* ~RCON */
-	C_SCON /* 0xffff */
+	C_RCON   /* 0xff rotated */
+	C_NCON   /* ~RCON */
+	C_RCON2A /* OR of two disjoint C_RCON constants */
+	C_RCON2S /* subtraction of two disjoint C_RCON constants */
+	C_SCON   /* 0xffff */
 	C_LCON
 	C_LCONADDR
 	C_ZFCON
@@ -228,6 +231,24 @@ const (
 	ASUBD
 	AMULF
 	AMULD
+	ANMULF
+	ANMULD
+	AMULAF
+	AMULAD
+	ANMULAF
+	ANMULAD
+	AMULSF
+	AMULSD
+	ANMULSF
+	ANMULSD
+	AFMULAF
+	AFMULAD
+	AFNMULAF
+	AFNMULAD
+	AFMULSF
+	AFMULSD
+	AFNMULSF
+	AFNMULSD
 	ADIVF
 	ADIVD
 	ASQRTF
@@ -243,9 +264,12 @@ const (
 	AMULU
 	ADIVU
 	AMUL
+	AMMUL
 	ADIV
 	AMOD
 	AMODU
+	ADIVHW
+	ADIVUHW
 
 	AMOVB
 	AMOVBS
@@ -261,6 +285,9 @@ const (
 	ARFE
 	ASWI
 	AMULA
+	AMULS
+	AMMULA
+	AMMULS
 
 	AWORD
 
@@ -281,11 +308,25 @@ const (
 	APLD
 
 	ACLZ
+	AREV
+	AREV16
+	AREVSH
+	ARBIT
+
+	AXTAB
+	AXTAH
+	AXTABU
+	AXTAHU
+
+	ABFX
+	ABFXU
 
 	AMULWT
 	AMULWB
+	AMULBB
 	AMULAWT
 	AMULAWB
+	AMULABB
 
 	ADATABUNDLE
 	ADATABUNDLEEND

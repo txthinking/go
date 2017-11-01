@@ -75,6 +75,7 @@ type transferWriter struct {
 	ContentLength    int64 // -1 means unknown, 0 means exactly none
 	Close            bool
 	TransferEncoding []string
+	Header           Header
 	Trailer          Header
 	IsResponse       bool
 	bodyReadError    error // any non-EOF error from reading Body
@@ -96,14 +97,15 @@ func newTransferWriter(r interface{}) (t *transferWriter, err error) {
 		t.Method = valueOrDefault(rr.Method, "GET")
 		t.Close = rr.Close
 		t.TransferEncoding = rr.TransferEncoding
+		t.Header = rr.Header
 		t.Trailer = rr.Trailer
-		atLeastHTTP11 = rr.protoAtLeastOutgoing(1, 1)
 		t.Body = rr.Body
 		t.BodyCloser = rr.Body
 		t.ContentLength = rr.outgoingLength()
-		if t.ContentLength < 0 && len(t.TransferEncoding) == 0 && atLeastHTTP11 && t.shouldSendChunkedRequestBody() {
+		if t.ContentLength < 0 && len(t.TransferEncoding) == 0 && t.shouldSendChunkedRequestBody() {
 			t.TransferEncoding = []string{"chunked"}
 		}
+		atLeastHTTP11 = true // Transport requests are always 1.1 or 2.0
 	case *Response:
 		t.IsResponse = true
 		if rr.Request != nil {
@@ -114,6 +116,7 @@ func newTransferWriter(r interface{}) (t *transferWriter, err error) {
 		t.ContentLength = rr.ContentLength
 		t.Close = rr.Close
 		t.TransferEncoding = rr.TransferEncoding
+		t.Header = rr.Header
 		t.Trailer = rr.Trailer
 		atLeastHTTP11 = rr.ProtoAtLeast(1, 1)
 		t.ResponseToHEAD = noResponseBodyExpected(t.Method)
@@ -266,7 +269,7 @@ func (t *transferWriter) shouldSendContentLength() bool {
 }
 
 func (t *transferWriter) WriteHeader(w io.Writer) error {
-	if t.Close {
+	if t.Close && !hasToken(t.Header.get("Connection"), "close") {
 		if _, err := io.WriteString(w, "Connection: close\r\n"); err != nil {
 			return err
 		}
@@ -494,7 +497,7 @@ func readTransfer(msg interface{}, r *bufio.Reader) (err error) {
 	// or close connection when finished, since multipart is not supported yet
 	switch {
 	case chunked(t.TransferEncoding):
-		if noResponseBodyExpected(t.RequestMethod) {
+		if noResponseBodyExpected(t.RequestMethod) || !bodyAllowedForStatus(t.StatusCode) {
 			t.Body = NoBody
 		} else {
 			t.Body = &body{src: internal.NewChunkedReader(r), hdr: msg, r: r, closing: t.Close}
@@ -660,9 +663,8 @@ func fixLength(isResponse bool, status int, requestMethod string, header Header,
 			return -1, err
 		}
 		return n, nil
-	} else {
-		header.Del("Content-Length")
 	}
+	header.Del("Content-Length")
 
 	if isRequest {
 		// RFC 2616 neither explicitly permits nor forbids an

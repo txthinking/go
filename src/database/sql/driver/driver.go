@@ -55,6 +55,29 @@ type Driver interface {
 	Open(name string) (Conn, error)
 }
 
+// Connector is an optional interface that drivers can implement.
+// It allows drivers to provide more flexible methods to open
+// database connections without requiring the use of a DSN string.
+type Connector interface {
+	// Connect returns a connection to the database.
+	// Connect may return a cached connection (one previously
+	// closed), but doing so is unnecessary; the sql package
+	// maintains a pool of idle connections for efficient re-use.
+	//
+	// The provided context.Context is for dialing purposes only
+	// (see net.DialContext) and should not be stored or used for
+	// other purposes.
+	//
+	// The returned connection is only used by one goroutine at a
+	// time.
+	Connect(context.Context) (Conn, error)
+
+	// Driver returns the underlying Driver of the Connector,
+	// mainly to maintain compatibility with the Driver method
+	// on sql.DB.
+	Driver() Driver
+}
+
 // ErrSkip may be returned by some optional interfaces' methods to
 // indicate at runtime that the fast path is unavailable and the sql
 // package should continue as if the optional interface was not
@@ -199,6 +222,18 @@ type ConnBeginTx interface {
 	BeginTx(ctx context.Context, opts TxOptions) (Tx, error)
 }
 
+// ResetSessioner may be implemented by Conn to allow drivers to reset the
+// session state associated with the connection and to signal a bad connection.
+type ResetSessioner interface {
+	// ResetSession is called while a connection is in the connection
+	// pool. No queries will run on this connection until this method returns.
+	//
+	// If the connection is bad this should return driver.ErrBadConn to prevent
+	// the connection from being returned to the connection pool. Any other
+	// error will be discarded.
+	ResetSession(ctx context.Context) error
+}
+
 // Result is the result of a query execution.
 type Result interface {
 	// LastInsertId returns the database's auto-generated ID
@@ -262,9 +297,39 @@ type StmtQueryContext interface {
 	QueryContext(ctx context.Context, args []NamedValue) (Rows, error)
 }
 
+// ErrRemoveArgument may be returned from NamedValueChecker to instruct the
+// sql package to not pass the argument to the driver query interface.
+// Return when accepting query specific options or structures that aren't
+// SQL query arguments.
+var ErrRemoveArgument = errors.New("driver: remove argument from query")
+
+// NamedValueChecker may be optionally implemented by Conn or Stmt. It provides
+// the driver more control to handle Go and database types beyond the default
+// Values types allowed.
+//
+// The sql package checks for value checkers in the following order,
+// stopping at the first found match: Stmt.NamedValueChecker, Conn.NamedValueChecker,
+// Stmt.ColumnConverter, DefaultParameterConverter.
+//
+// If CheckNamedValue returns ErrRemoveArgument, the NamedValue will not be included in
+// the final query arguments. This may be used to pass special options to
+// the query itself.
+//
+// If ErrSkip is returned the column converter error checking
+// path is used for the argument. Drivers may wish to return ErrSkip after
+// they have exhausted their own special cases.
+type NamedValueChecker interface {
+	// CheckNamedValue is called before passing arguments to the driver
+	// and is called in place of any ColumnConverter. CheckNamedValue must do type
+	// validation and conversion as appropriate for the driver.
+	CheckNamedValue(*NamedValue) error
+}
+
 // ColumnConverter may be optionally implemented by Stmt if the
 // statement is aware of its own columns' types and can convert from
 // any type to a driver Value.
+//
+// Deprecated: Drivers should implement NamedValueChecker.
 type ColumnConverter interface {
 	// ColumnConverter returns a ValueConverter for the provided
 	// column index. If the type of a specific column isn't known

@@ -726,7 +726,9 @@ func (u *URL) String() string {
 		buf.WriteString(u.Opaque)
 	} else {
 		if u.Scheme != "" || u.Host != "" || u.User != nil {
-			buf.WriteString("//")
+			if u.Host != "" || u.Path != "" || u.User != nil {
+				buf.WriteString("//")
+			}
 			if ui := u.User; ui != nil {
 				buf.WriteString(ui.String())
 				buf.WriteByte('@')
@@ -909,7 +911,7 @@ func resolvePath(base, ref string) string {
 		// Add final slash to the joined path.
 		dst = append(dst, "")
 	}
-	return "/" + strings.TrimLeft(strings.Join(dst, "/"), "/")
+	return "/" + strings.TrimPrefix(strings.Join(dst, "/"), "/")
 }
 
 // IsAbs reports whether the URL is absolute.
@@ -953,12 +955,10 @@ func (u *URL) ResolveReference(ref *URL) *URL {
 		url.Path = ""
 		return &url
 	}
-	if ref.Path == "" {
-		if ref.RawQuery == "" {
-			url.RawQuery = u.RawQuery
-			if ref.Fragment == "" {
-				url.Fragment = u.Fragment
-			}
+	if ref.Path == "" && ref.RawQuery == "" {
+		url.RawQuery = u.RawQuery
+		if ref.Fragment == "" {
+			url.Fragment = u.Fragment
 		}
 	}
 	// The "abs_path" or "rel_path" cases.

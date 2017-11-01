@@ -11,9 +11,13 @@ import (
 	"hash"
 	"hash/crc32"
 	"io"
+	"unicode/utf8"
 )
 
-// TODO(adg): support zip file comments
+var (
+	errLongName  = errors.New("zip: FileHeader.Name too long")
+	errLongExtra = errors.New("zip: FileHeader.Extra too long")
+)
 
 // Writer implements a zip file writer.
 type Writer struct {
@@ -26,6 +30,9 @@ type Writer struct {
 	// testHookCloseSizeOffset if non-nil is called with the size
 	// of offset of the central directory at Close.
 	testHookCloseSizeOffset func(size, offset uint64)
+
+	// Comment is the central directory comment and must be set before Close is called.
+	Comment string
 }
 
 type header struct {
@@ -58,6 +65,10 @@ func (w *Writer) Flush() error {
 // Close finishes writing the zip file by writing the central directory.
 // It does not (and cannot) close the underlying writer.
 func (w *Writer) Close() error {
+	if len(w.Comment) > uint16max {
+		return errors.New("zip: Writer.Comment too long")
+	}
+
 	if w.last != nil && !w.last.closed {
 		if err := w.last.close(); err != nil {
 			return err
@@ -173,13 +184,16 @@ func (w *Writer) Close() error {
 	var buf [directoryEndLen]byte
 	b := writeBuf(buf[:])
 	b.uint32(uint32(directoryEndSignature))
-	b = b[4:]                 // skip over disk number and first disk number (2x uint16)
-	b.uint16(uint16(records)) // number of entries this disk
-	b.uint16(uint16(records)) // number of entries total
-	b.uint32(uint32(size))    // size of directory
-	b.uint32(uint32(offset))  // start of directory
-	// skipped size of comment (always zero)
+	b = b[4:]                        // skip over disk number and first disk number (2x uint16)
+	b.uint16(uint16(records))        // number of entries this disk
+	b.uint16(uint16(records))        // number of entries total
+	b.uint32(uint32(size))           // size of directory
+	b.uint32(uint32(offset))         // start of directory
+	b.uint16(uint16(len(w.Comment))) // byte size of EOCD comment
 	if _, err := w.cw.Write(buf[:]); err != nil {
+		return err
+	}
+	if _, err := io.WriteString(w.cw, w.Comment); err != nil {
 		return err
 	}
 
@@ -201,6 +215,22 @@ func (w *Writer) Create(name string) (io.Writer, error) {
 	return w.CreateHeader(header)
 }
 
+// detectUTF8 reports whether s is a valid UTF-8 string, and whether the string
+// must be considered UTF-8 encoding (i.e., not compatible with CP-437).
+func detectUTF8(s string) (valid, require bool) {
+	for _, r := range s {
+		// By default, ZIP uses CP-437,
+		// which is only identical to ASCII for the printable characters.
+		if r < 0x20 || r >= 0x7f {
+			if !utf8.ValidRune(r) || r == utf8.RuneError {
+				return false, false
+			}
+			require = true
+		}
+	}
+	return true, require
+}
+
 // CreateHeader adds a file to the zip file using the provided FileHeader
 // for the file metadata.
 // It returns a Writer to which the file contents should be written.
@@ -220,6 +250,31 @@ func (w *Writer) CreateHeader(fh *FileHeader) (io.Writer, error) {
 	}
 
 	fh.Flags |= 0x8 // we will write a data descriptor
+
+	// The ZIP format has a sad state of affairs regarding character encoding.
+	// Officially, the name and comment fields are supposed to be encoded
+	// in CP-437 (which is mostly compatible with ASCII), unless the UTF-8
+	// flag bit is set. However, there are several problems:
+	//
+	//	* Many ZIP readers still do not support UTF-8.
+	//	* If the UTF-8 flag is cleared, several readers simply interpret the
+	//	name and comment fields as whatever the local system encoding is.
+	//
+	// In order to avoid breaking readers without UTF-8 support,
+	// we avoid setting the UTF-8 flag if the strings are CP-437 compatible.
+	// However, if the strings require multibyte UTF-8 encoding and is a
+	// valid UTF-8 string, then we set the UTF-8 bit.
+	//
+	// For the case, where the user explicitly wants to specify the encoding
+	// as UTF-8, they will need to set the flag bit themselves.
+	// TODO: For the case, where the user explicitly wants to specify that the
+	// encoding is *not* UTF-8, that is currently not possible.
+	// See golang.org/issue/10741.
+	utf8Valid1, utf8Require1 := detectUTF8(fh.Name)
+	utf8Valid2, utf8Require2 := detectUTF8(fh.Comment)
+	if (utf8Require1 || utf8Require2) && utf8Valid1 && utf8Valid2 {
+		fh.Flags |= 0x800
+	}
 
 	fh.CreatorVersion = fh.CreatorVersion&0xff00 | zipVersion20 // preserve compatibility byte
 	fh.ReaderVersion = zipVersion20
@@ -256,6 +311,14 @@ func (w *Writer) CreateHeader(fh *FileHeader) (io.Writer, error) {
 }
 
 func writeHeader(w io.Writer, h *FileHeader) error {
+	const maxUint16 = 1<<16 - 1
+	if len(h.Name) > maxUint16 {
+		return errLongName
+	}
+	if len(h.Extra) > maxUint16 {
+		return errLongExtra
+	}
+
 	var buf [fileHeaderLen]byte
 	b := writeBuf(buf[:])
 	b.uint32(uint32(fileHeaderSignature))

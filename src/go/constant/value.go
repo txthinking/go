@@ -10,7 +10,7 @@
 // values produce unknown values unless specified
 // otherwise.
 //
-package constant // import "go/constant"
+package constant
 
 import (
 	"fmt"
@@ -247,6 +247,13 @@ func makeFloatFromLiteral(lit string) Value {
 	if f, ok := newFloat().SetString(lit); ok {
 		if smallRat(f) {
 			// ok to use rationals
+			if f.Sign() == 0 {
+				// Issue 20228: If the float underflowed to zero, parse just "0".
+				// Otherwise, lit might contain a value with a large negative exponent,
+				// such as -6e-1886451601. As a float, that will underflow to 0,
+				// but it'll take forever to parse as a Rat.
+				lit = "0"
+			}
 			r, _ := newRat().SetString(lit)
 			return ratVal{r}
 		}

@@ -233,6 +233,7 @@ var truncateRoundTests = []struct {
 	{Date(-1, January, 1, 12, 15, 31, 5e8, UTC), 3},
 	{Date(2012, January, 1, 12, 15, 30, 5e8, UTC), Second},
 	{Date(2012, January, 1, 12, 15, 31, 5e8, UTC), Second},
+	{Unix(-19012425939, 649146258), 7435029458905025217}, // 5.8*d rounds to 6*d, but .8*d+.8*d < 0 < d
 }
 
 func TestTruncateRound(t *testing.T) {
@@ -574,6 +575,7 @@ var dateTests = []struct {
 	{2011, 3, 13, 1, 59, 59, 0, Local, 1300010399}, // 1:59:59 PST
 	{2011, 3, 13, 3, 0, 0, 0, Local, 1300010400},   // 3:00:00 PDT
 	{2011, 3, 13, 2, 30, 0, 0, Local, 1300008600},  // 2:30:00 PDT ≡ 1:30 PST
+	{2012, 12, 24, 0, 0, 0, 0, Local, 1356336000},  // Leap year
 
 	// Many names for Fri Nov 18 7:56:35 PST 2011
 	{2011, 11, 18, 7, 56, 35, 0, Local, 1321631795},                 // Nov 18 7:56:35
@@ -1107,6 +1109,7 @@ var durationRoundTests = []struct {
 	{9e18, 5e18, 1<<63 - 1},
 	{-8e18, 3e18, -9e18},
 	{-9e18, 5e18, -1 << 63},
+	{3<<61 - 1, 3 << 61, 3 << 61},
 }
 
 func TestDurationRound(t *testing.T) {
@@ -1200,8 +1203,8 @@ var defaultLocTests = []struct {
 }
 
 func TestDefaultLoc(t *testing.T) {
-	//This test verifyes that all Time's methods behaves identical if loc is set
-	//as nil or UTC
+	// Verify that all of Time's methods behave identically if loc is set to
+	// nil or UTC.
 	for _, tt := range defaultLocTests {
 		t1 := Time{}
 		t2 := Time{}.UTC()

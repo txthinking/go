@@ -67,25 +67,39 @@ func MatchPackages(pattern string) []string {
 			root += "cmd" + string(filepath.Separator)
 		}
 		filepath.Walk(root, func(path string, fi os.FileInfo, err error) error {
-			if err != nil || !fi.IsDir() || path == src {
+			if err != nil || path == src {
 				return nil
 			}
 
+			want := true
 			// Avoid .foo, _foo, and testdata directory trees.
 			_, elem := filepath.Split(path)
 			if strings.HasPrefix(elem, ".") || strings.HasPrefix(elem, "_") || elem == "testdata" {
-				return filepath.SkipDir
+				want = false
 			}
 
 			name := filepath.ToSlash(path[len(src):])
 			if pattern == "std" && (!isStandardImportPath(name) || name == "cmd") {
 				// The name "std" is only the standard library.
 				// If the name is cmd, it's the root of the command tree.
-				return filepath.SkipDir
+				want = false
 			}
 			if !treeCanMatch(name) {
+				want = false
+			}
+
+			if !fi.IsDir() {
+				if fi.Mode()&os.ModeSymlink != 0 && want {
+					if target, err := os.Stat(path); err == nil && target.IsDir() {
+						fmt.Fprintf(os.Stderr, "warning: ignoring symlink %s\n", path)
+					}
+				}
+				return nil
+			}
+			if !want {
 				return filepath.SkipDir
 			}
+
 			if have[name] {
 				return nil
 			}
@@ -202,17 +216,69 @@ func treeCanMatchPattern(pattern string) func(name string) bool {
 // name matches pattern. Pattern is a limited glob
 // pattern in which '...' means 'any string' and there
 // is no other special syntax.
+// Unfortunately, there are two special cases. Quoting "go help packages":
+//
+// First, /... at the end of the pattern can match an empty string,
+// so that net/... matches both net and packages in its subdirectories, like net/http.
+// Second, any slash-separted pattern element containing a wildcard never
+// participates in a match of the "vendor" element in the path of a vendored
+// package, so that ./... does not match packages in subdirectories of
+// ./vendor or ./mycode/vendor, but ./vendor/... and ./mycode/vendor/... do.
+// Note, however, that a directory named vendor that itself contains code
+// is not a vendored package: cmd/vendor would be a command named vendor,
+// and the pattern cmd/... matches it.
 func matchPattern(pattern string) func(name string) bool {
+	// Convert pattern to regular expression.
+	// The strategy for the trailing /... is to nest it in an explicit ? expression.
+	// The strategy for the vendor exclusion is to change the unmatchable
+	// vendor strings to a disallowed code point (vendorChar) and to use
+	// "(anything but that codepoint)*" as the implementation of the ... wildcard.
+	// This is a bit complicated but the obvious alternative,
+	// namely a hand-written search like in most shell glob matchers,
+	// is too easy to make accidentally exponential.
+	// Using package regexp guarantees linear-time matching.
+
+	const vendorChar = "\x00"
+
+	if strings.Contains(pattern, vendorChar) {
+		return func(name string) bool { return false }
+	}
+
 	re := regexp.QuoteMeta(pattern)
-	re = strings.Replace(re, `\.\.\.`, `.*`, -1)
-	// Special case: foo/... matches foo too.
-	if strings.HasSuffix(re, `/.*`) {
-		re = re[:len(re)-len(`/.*`)] + `(/.*)?`
+	re = replaceVendor(re, vendorChar)
+	switch {
+	case strings.HasSuffix(re, `/`+vendorChar+`/\.\.\.`):
+		re = strings.TrimSuffix(re, `/`+vendorChar+`/\.\.\.`) + `(/vendor|/` + vendorChar + `/\.\.\.)`
+	case re == vendorChar+`/\.\.\.`:
+		re = `(/vendor|/` + vendorChar + `/\.\.\.)`
+	case strings.HasSuffix(re, `/\.\.\.`):
+		re = strings.TrimSuffix(re, `/\.\.\.`) + `(/\.\.\.)?`
 	}
+	re = strings.Replace(re, `\.\.\.`, `[^`+vendorChar+`]*`, -1)
+
 	reg := regexp.MustCompile(`^` + re + `$`)
+
 	return func(name string) bool {
-		return reg.MatchString(name)
+		if strings.Contains(name, vendorChar) {
+			return false
+		}
+		return reg.MatchString(replaceVendor(name, vendorChar))
 	}
+}
+
+// replaceVendor returns the result of replacing
+// non-trailing vendor path elements in x with repl.
+func replaceVendor(x, repl string) string {
+	if !strings.Contains(x, "vendor") {
+		return x
+	}
+	elem := strings.Split(x, "/")
+	for i := 0; i < len(elem)-1; i++ {
+		if elem[i] == "vendor" {
+			elem[i] = repl
+		}
+	}
+	return strings.Join(elem, "/")
 }
 
 // ImportPaths returns the import paths to use for the given command line.
@@ -266,7 +332,7 @@ func ImportPathsNoDotExpansion(args []string) []string {
 	return out
 }
 
-// isMetaPackage checks if name is a reserved package name that expands to multiple packages.
+// IsMetaPackage checks if name is a reserved package name that expands to multiple packages.
 func IsMetaPackage(name string) bool {
 	return name == "std" || name == "cmd" || name == "all"
 }

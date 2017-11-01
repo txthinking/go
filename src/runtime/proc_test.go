@@ -53,14 +53,14 @@ func TestStopTheWorldDeadlock(t *testing.T) {
 }
 
 func TestYieldProgress(t *testing.T) {
-	testYieldProgress(t, false)
+	testYieldProgress(false)
 }
 
 func TestYieldLockedProgress(t *testing.T) {
-	testYieldProgress(t, true)
+	testYieldProgress(true)
 }
 
-func testYieldProgress(t *testing.T, locked bool) {
+func testYieldProgress(locked bool) {
 	c := make(chan bool)
 	cack := make(chan bool)
 	go func() {
@@ -428,10 +428,13 @@ func TestPingPongHog(t *testing.T) {
 	<-lightChan
 
 	// Check that hogCount and lightCount are within a factor of
-	// 2, which indicates that both pairs of goroutines handed off
-	// the P within a time-slice to their buddy.
-	if hogCount > lightCount*2 || lightCount > hogCount*2 {
-		t.Fatalf("want hogCount/lightCount in [0.5, 2]; got %d/%d = %g", hogCount, lightCount, float64(hogCount)/float64(lightCount))
+	// 5, which indicates that both pairs of goroutines handed off
+	// the P within a time-slice to their buddy. We can use a
+	// fairly large factor here to make this robust: if the
+	// scheduler isn't working right, the gap should be ~1000X.
+	const factor = 5
+	if hogCount > lightCount*factor || lightCount > hogCount*factor {
+		t.Fatalf("want hogCount/lightCount in [%v, %v]; got %d/%d = %g", 1.0/factor, factor, hogCount, lightCount, float64(hogCount)/float64(lightCount))
 	}
 }
 
@@ -718,4 +721,45 @@ func matmult(done chan<- struct{}, A, B, C Matrix, i0, i1, j0, j1, k0, k1, thres
 
 func TestStealOrder(t *testing.T) {
 	runtime.RunStealOrderTest()
+}
+
+func TestLockOSThreadNesting(t *testing.T) {
+	go func() {
+		e, i := runtime.LockOSCounts()
+		if e != 0 || i != 0 {
+			t.Errorf("want locked counts 0, 0; got %d, %d", e, i)
+			return
+		}
+		runtime.LockOSThread()
+		runtime.LockOSThread()
+		runtime.UnlockOSThread()
+		e, i = runtime.LockOSCounts()
+		if e != 1 || i != 0 {
+			t.Errorf("want locked counts 1, 0; got %d, %d", e, i)
+			return
+		}
+		runtime.UnlockOSThread()
+		e, i = runtime.LockOSCounts()
+		if e != 0 || i != 0 {
+			t.Errorf("want locked counts 0, 0; got %d, %d", e, i)
+			return
+		}
+	}()
+}
+
+func TestLockOSThreadExit(t *testing.T) {
+	testLockOSThreadExit(t, "testprog")
+}
+
+func testLockOSThreadExit(t *testing.T, prog string) {
+	output := runTestProg(t, prog, "LockOSThreadMain", "GOMAXPROCS=1")
+	want := "OK\n"
+	if output != want {
+		t.Errorf("want %s, got %s\n", want, output)
+	}
+
+	output = runTestProg(t, prog, "LockOSThreadAlt")
+	if output != want {
+		t.Errorf("want %s, got %s\n", want, output)
+	}
 }

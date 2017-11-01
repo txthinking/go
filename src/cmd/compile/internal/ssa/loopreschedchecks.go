@@ -4,7 +4,10 @@
 
 package ssa
 
-import "fmt"
+import (
+	"cmd/compile/internal/types"
+	"fmt"
+)
 
 // an edgeMem records a backedge, together with the memory
 // phi functions at the target of the backedge that must
@@ -14,7 +17,7 @@ type edgeMem struct {
 	m *Value // phi for memory at dest of e
 }
 
-// a rewriteTarget is a a value-argindex pair indicating
+// a rewriteTarget is a value-argindex pair indicating
 // where a rewrite is applied.  Note that this is for values,
 // not for block controls, because block controls are not targets
 // for the rewrites performed in inserting rescheduling checks.
@@ -70,9 +73,13 @@ func insertLoopReschedChecks(f *Func) {
 	lastMems := findLastMems(f)
 
 	idom := f.Idom()
-	sdom := f.sdom()
+	po := f.postorder()
+	// The ordering in the dominator tree matters; it's important that
+	// the walk of the dominator tree also be a preorder (i.e., a node is
+	// visited only after all its non-backedge predecessors have been visited).
+	sdom := newSparseOrderedTree(f, idom, po)
 
-	if f.pass.debug > 2 {
+	if f.pass.debug > 1 {
 		fmt.Printf("before %s = %s\n", f.Name, sdom.treestructure(f.Entry))
 	}
 
@@ -84,13 +91,12 @@ func insertLoopReschedChecks(f *Func) {
 
 	// It's possible that there is no memory state (no global/pointer loads/stores or calls)
 	if lastMems[f.Entry.ID] == nil {
-		lastMems[f.Entry.ID] = f.Entry.NewValue0(f.Entry.Pos, OpInitMem, TypeMem)
+		lastMems[f.Entry.ID] = f.Entry.NewValue0(f.Entry.Pos, OpInitMem, types.TypeMem)
 	}
 
 	memDefsAtBlockEnds := make([]*Value, f.NumBlocks()) // For each block, the mem def seen at its bottom. Could be from earlier block.
 
 	// Propagate last mem definitions forward through successor blocks.
-	po := f.postorder()
 	for i := len(po) - 1; i >= 0; i-- {
 		b := po[i]
 		mem := lastMems[b.ID]
@@ -99,6 +105,9 @@ func insertLoopReschedChecks(f *Func) {
 			mem = memDefsAtBlockEnds[b.Preds[j].b.ID]
 		}
 		memDefsAtBlockEnds[b.ID] = mem
+		if f.pass.debug > 2 {
+			fmt.Printf("memDefsAtBlockEnds[%s] = %s\n", b, mem)
+		}
 	}
 
 	// Maps from block to newly-inserted phi function in block.
@@ -123,18 +132,27 @@ func insertLoopReschedChecks(f *Func) {
 			mem0 := memDefsAtBlockEnds[idom[h.ID].ID]
 			headerMemPhi = newPhiFor(h, mem0)
 			newmemphis[h] = rewrite{before: mem0, after: headerMemPhi}
-			addDFphis(mem0, h, h, f, memDefsAtBlockEnds, newmemphis)
+			addDFphis(mem0, h, h, f, memDefsAtBlockEnds, newmemphis, sdom)
 
 		}
 		tofixBackedges[i].m = headerMemPhi
 
 	}
+	if f.pass.debug > 0 {
+		for b, r := range newmemphis {
+			fmt.Printf("before b=%s, rewrite=%s\n", b, r.String())
+		}
+	}
 
-	rewriteNewPhis(f.Entry, f.Entry, f, memDefsAtBlockEnds, newmemphis)
+	// dfPhiTargets notes inputs to phis in dominance frontiers that should not
+	// be rewritten as part of the dominated children of some outer rewrite.
+	dfPhiTargets := make(map[rewriteTarget]bool)
+
+	rewriteNewPhis(f.Entry, f.Entry, f, memDefsAtBlockEnds, newmemphis, dfPhiTargets, sdom)
 
 	if f.pass.debug > 0 {
 		for b, r := range newmemphis {
-			fmt.Printf("b=%s, rewrite=%s\n", b, r.String())
+			fmt.Printf("after b=%s, rewrite=%s\n", b, r.String())
 		}
 	}
 
@@ -197,8 +215,8 @@ func insertLoopReschedChecks(f *Func) {
 		// if sp < g.limit { goto sched }
 		// goto header
 
-		types := &f.Config.Types
-		pt := types.Uintptr
+		cfgtypes := &f.Config.Types
+		pt := cfgtypes.Uintptr
 		g := test.NewValue1(bb.Pos, OpGetG, pt, mem0)
 		sp := test.NewValue0(bb.Pos, OpSP, pt)
 		cmpOp := OpLess64U
@@ -207,7 +225,7 @@ func insertLoopReschedChecks(f *Func) {
 		}
 		limaddr := test.NewValue1I(bb.Pos, OpOffPtr, pt, 2*pt.Size(), g)
 		lim := test.NewValue2(bb.Pos, OpLoad, pt, limaddr, mem0)
-		cmp := test.NewValue2(bb.Pos, cmpOp, types.Bool, sp, lim)
+		cmp := test.NewValue2(bb.Pos, cmpOp, cfgtypes.Bool, sp, lim)
 		test.SetControl(cmp)
 
 		// if true, goto sched
@@ -226,7 +244,7 @@ func insertLoopReschedChecks(f *Func) {
 		//    mem1 := call resched (mem0)
 		//    goto header
 		resched := f.fe.Syslook("goschedguarded")
-		mem1 := sched.NewValue1A(bb.Pos, OpStaticCall, TypeMem, resched, mem0)
+		mem1 := sched.NewValue1A(bb.Pos, OpStaticCall, types.TypeMem, resched, mem0)
 		sched.AddEdgeTo(h)
 		headerMemPhi.AddArg(mem1)
 
@@ -245,12 +263,10 @@ func insertLoopReschedChecks(f *Func) {
 
 	f.invalidateCFG()
 
-	if f.pass.debug > 2 {
+	if f.pass.debug > 1 {
 		sdom = newSparseTree(f, f.Idom())
 		fmt.Printf("after %s = %s\n", f.Name, sdom.treestructure(f.Entry))
 	}
-
-	return
 }
 
 // newPhiFor inserts a new Phi function into b,
@@ -269,7 +285,10 @@ func newPhiFor(b *Block, v *Value) *Value {
 // if b has its own phi definition then it takes the place of h.
 // defsForUses provides information about other definitions of the variable that are present
 // (and if nil, indicates that the variable is no longer live)
-func rewriteNewPhis(h, b *Block, f *Func, defsForUses []*Value, newphis map[*Block]rewrite) {
+// sdom must yield a preorder of the flow graph if recursively walked, root-to-children.
+// The result of newSparseOrderedTree with order supplied by a dfs-postorder satisfies this
+// requirement.
+func rewriteNewPhis(h, b *Block, f *Func, defsForUses []*Value, newphis map[*Block]rewrite, dfPhiTargets map[rewriteTarget]bool, sdom SparseTree) {
 	// If b is a block with a new phi, then a new rewrite applies below it in the dominator tree.
 	if _, ok := newphis[b]; ok {
 		h = b
@@ -289,7 +308,19 @@ func rewriteNewPhis(h, b *Block, f *Func, defsForUses []*Value, newphis map[*Blo
 				if w != x {
 					continue
 				}
-				*p = append(*p, rewriteTarget{v, i})
+				tgt := rewriteTarget{v, i}
+
+				// It's possible dominated control flow will rewrite this instead.
+				// Visiting in preorder (a property of how sdom was constructed)
+				// ensures that these are seen in the proper order.
+				if dfPhiTargets[tgt] {
+					continue
+				}
+				*p = append(*p, tgt)
+				if f.pass.debug > 1 {
+					fmt.Printf("added block target for h=%v, b=%v, x=%v, y=%v, tgt.v=%s, tgt.i=%d\n",
+						h, b, x, y, v, i)
+				}
 			}
 		}
 
@@ -301,13 +332,16 @@ func rewriteNewPhis(h, b *Block, f *Func, defsForUses []*Value, newphis map[*Blo
 		if dfu := defsForUses[b.ID]; dfu != nil && dfu.Block != b {
 			for _, e := range b.Succs {
 				s := e.b
-				if sphi, ok := newphis[s]; ok { // saves time to find the phi this way.
-					*p = append(*p, rewriteTarget{sphi.after, e.i})
-					continue
-				}
+
 				for _, v := range s.Values {
 					if v.Op == OpPhi && v.Args[e.i] == x {
-						*p = append(*p, rewriteTarget{v, e.i})
+						tgt := rewriteTarget{v, e.i}
+						*p = append(*p, tgt)
+						dfPhiTargets[tgt] = true
+						if f.pass.debug > 1 {
+							fmt.Printf("added phi target for h=%v, b=%v, s=%v, x=%v, y=%v, tgt.v=%s, tgt.i=%d\n",
+								h, b, s, x, y, v.LongString(), e.i)
+						}
 						break
 					}
 				}
@@ -316,10 +350,8 @@ func rewriteNewPhis(h, b *Block, f *Func, defsForUses []*Value, newphis map[*Blo
 		newphis[h] = change
 	}
 
-	sdom := f.sdom()
-
 	for c := sdom[b.ID].child; c != nil; c = sdom[c.ID].sibling {
-		rewriteNewPhis(h, c, f, defsForUses, newphis) // TODO: convert to explicit stack from recursion.
+		rewriteNewPhis(h, c, f, defsForUses, newphis, dfPhiTargets, sdom) // TODO: convert to explicit stack from recursion.
 	}
 }
 
@@ -330,12 +362,11 @@ func rewriteNewPhis(h, b *Block, f *Func, defsForUses []*Value, newphis map[*Blo
 // either b = h or h strictly dominates b.
 // These newly created phis are themselves new definitions that may require addition of their
 // own trivial phi functions in their own dominance frontier, and this is handled recursively.
-func addDFphis(x *Value, h, b *Block, f *Func, defForUses []*Value, newphis map[*Block]rewrite) {
+func addDFphis(x *Value, h, b *Block, f *Func, defForUses []*Value, newphis map[*Block]rewrite, sdom SparseTree) {
 	oldv := defForUses[b.ID]
 	if oldv != x { // either a new definition replacing x, or nil if it is proven that there are no uses reachable from b
 		return
 	}
-	sdom := f.sdom()
 	idom := f.Idom()
 outer:
 	for _, e := range b.Succs {
@@ -359,10 +390,10 @@ outer:
 		headerPhi := newPhiFor(s, old)
 		// the new phi will replace "old" in block s and all blocks dominated by s.
 		newphis[s] = rewrite{before: old, after: headerPhi} // record new phi, to have inputs labeled "old" rewritten to "headerPhi"
-		addDFphis(old, s, s, f, defForUses, newphis)        // the new definition may also create new phi functions.
+		addDFphis(old, s, s, f, defForUses, newphis, sdom)  // the new definition may also create new phi functions.
 	}
 	for c := sdom[b.ID].child; c != nil; c = sdom[c.ID].sibling {
-		addDFphis(x, h, c, f, defForUses, newphis) // TODO: convert to explicit stack from recursion.
+		addDFphis(x, h, c, f, defForUses, newphis, sdom) // TODO: convert to explicit stack from recursion.
 	}
 }
 
@@ -388,10 +419,6 @@ func findLastMems(f *Func) []*Value {
 			}
 			if v.Type.IsMemory() {
 				stores = append(stores, v)
-				if v.Op == OpSelect1 {
-					// Use the arg of the tuple-generating op.
-					v = v.Args[0]
-				}
 				for _, a := range v.Args {
 					if a.Block == b && a.Type.IsMemory() {
 						storeUse.add(a.ID)

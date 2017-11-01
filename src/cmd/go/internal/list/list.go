@@ -33,7 +33,7 @@ The default output shows the package import path:
     golang.org/x/net/html
 
 The -f flag specifies an alternate format for the list, using the
-syntax of package template.  The default output is equivalent to -f
+syntax of package template. The default output is equivalent to -f
 '{{.ImportPath}}'. The struct being passed to the template is:
 
     type Package struct {
@@ -126,12 +126,12 @@ The -json flag causes the package data to be printed in JSON format
 instead of using the template format.
 
 The -e flag changes the handling of erroneous packages, those that
-cannot be found or are malformed.  By default, the list command
+cannot be found or are malformed. By default, the list command
 prints an error to standard error for each erroneous package and
 omits the packages from consideration during the usual printing.
 With the -e flag, the list command never prints errors to standard
 error and instead processes the erroneous packages with the usual
-printing.  Erroneous packages will have a non-empty ImportPath and
+printing. Erroneous packages will have a non-empty ImportPath and
 a non-nil Error field; other information may or may not be missing
 (zeroed).
 
@@ -194,12 +194,29 @@ func runList(cmd *base.Command, args []string) {
 		}
 	}
 
-	loadpkgs := load.Packages
+	var pkgs []*load.Package
 	if *listE {
-		loadpkgs = load.PackagesAndErrors
+		pkgs = load.PackagesAndErrors(args)
+	} else {
+		pkgs = load.Packages(args)
 	}
 
-	for _, pkg := range loadpkgs(args) {
+	// Estimate whether staleness information is needed,
+	// since it's a little bit of work to compute.
+	needStale := *listJson || strings.Contains(*listFmt, ".Stale")
+	if needStale {
+		var b work.Builder
+		b.Init()
+		b.ComputeStaleOnly = true
+		a := &work.Action{}
+		// TODO: Use pkgsFilter?
+		for _, p := range pkgs {
+			a.Deps = append(a.Deps, b.AutoAction(work.ModeInstall, work.ModeInstall, p))
+		}
+		b.Do(a)
+	}
+
+	for _, pkg := range pkgs {
 		// Show vendor-expanded paths in listing
 		pkg.TestImports = pkg.Vendored(pkg.TestImports)
 		pkg.XTestImports = pkg.Vendored(pkg.XTestImports)

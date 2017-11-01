@@ -3,7 +3,7 @@
 // license that can be found in the LICENSE file.
 
 // +build cgo
-// +build darwin dragonfly freebsd linux netbsd solaris
+// +build darwin dragonfly freebsd linux netbsd openbsd solaris
 
 #include <pthread.h>
 #include <errno.h>
@@ -98,6 +98,10 @@ _cgo_try_pthread_create(pthread_t* thread, const pthread_attr_t* attr, void* (*p
 
 	for (tries = 0; tries < 20; tries++) {
 		err = pthread_create(thread, attr, pfn, arg);
+		if (err == 0) {
+			pthread_detach(*thread);
+			return 0;
+		}
 		if (err != EAGAIN) {
 			return err;
 		}

@@ -646,7 +646,7 @@ var marshalTests = []struct {
 	{Value: &Universe{Visible: 9.3e13}, ExpectXML: `<universe>9.3e+13</universe>`},
 	{Value: &Particle{HasMass: true}, ExpectXML: `<particle>true</particle>`},
 	{Value: &Departure{When: ParseTime("2013-01-09T00:15:00-09:00")}, ExpectXML: `<departure>2013-01-09T00:15:00-09:00</departure>`},
-	{Value: atomValue, ExpectXML: atomXml},
+	{Value: atomValue, ExpectXML: atomXML},
 	{
 		Value: &Ship{
 			Name:  "Heart of Gold",
@@ -1901,17 +1901,21 @@ func TestMarshalFlush(t *testing.T) {
 
 func BenchmarkMarshal(b *testing.B) {
 	b.ReportAllocs()
-	for i := 0; i < b.N; i++ {
-		Marshal(atomValue)
-	}
+	b.RunParallel(func(pb *testing.PB) {
+		for pb.Next() {
+			Marshal(atomValue)
+		}
+	})
 }
 
 func BenchmarkUnmarshal(b *testing.B) {
 	b.ReportAllocs()
-	xml := []byte(atomXml)
-	for i := 0; i < b.N; i++ {
-		Unmarshal(xml, &Feed{})
-	}
+	xml := []byte(atomXML)
+	b.RunParallel(func(pb *testing.PB) {
+		for pb.Next() {
+			Unmarshal(xml, &Feed{})
+		}
+	})
 }
 
 // golang.org/issue/6556

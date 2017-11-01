@@ -8,8 +8,6 @@
 // collections.
 package sort
 
-import "reflect"
-
 // A type, typically a collection, that satisfies sort.Interface can be
 // sorted by the routines in this package. The methods require that the
 // elements of the collection be enumerated by an integer index.
@@ -238,43 +236,6 @@ type lessSwap struct {
 	Swap func(i, j int)
 }
 
-// Slice sorts the provided slice given the provided less function.
-//
-// The sort is not guaranteed to be stable. For a stable sort, use
-// SliceStable.
-//
-// The function panics if the provided interface is not a slice.
-func Slice(slice interface{}, less func(i, j int) bool) {
-	rv := reflect.ValueOf(slice)
-	swap := reflect.Swapper(slice)
-	length := rv.Len()
-	quickSort_func(lessSwap{less, swap}, 0, length, maxDepth(length))
-}
-
-// SliceStable sorts the provided slice given the provided less
-// function while keeping the original order of equal elements.
-//
-// The function panics if the provided interface is not a slice.
-func SliceStable(slice interface{}, less func(i, j int) bool) {
-	rv := reflect.ValueOf(slice)
-	swap := reflect.Swapper(slice)
-	stable_func(lessSwap{less, swap}, rv.Len())
-}
-
-// SliceIsSorted tests whether a slice is sorted.
-//
-// The function panics if the provided interface is not a slice.
-func SliceIsSorted(slice interface{}, less func(i, j int) bool) bool {
-	rv := reflect.ValueOf(slice)
-	n := rv.Len()
-	for i := n - 1; i > 0; i-- {
-		if less(i, i-1) {
-			return false
-		}
-	}
-	return true
-}
-
 type reverse struct {
 	// This embedded Interface permits Reverse to use the methods of
 	// another Interface implementation.
@@ -314,7 +275,8 @@ func (p IntSlice) Swap(i, j int)      { p[i], p[j] = p[j], p[i] }
 // Sort is a convenience method.
 func (p IntSlice) Sort() { Sort(p) }
 
-// Float64Slice attaches the methods of Interface to []float64, sorting in increasing order.
+// Float64Slice attaches the methods of Interface to []float64, sorting in increasing order
+// (not-a-number values are treated as less than other values).
 type Float64Slice []float64
 
 func (p Float64Slice) Len() int           { return len(p) }
@@ -344,7 +306,8 @@ func (p StringSlice) Sort() { Sort(p) }
 // Ints sorts a slice of ints in increasing order.
 func Ints(a []int) { Sort(IntSlice(a)) }
 
-// Float64s sorts a slice of float64s in increasing order.
+// Float64s sorts a slice of float64s in increasing order
+// (not-a-number values are treated as less than other values).
 func Float64s(a []float64) { Sort(Float64Slice(a)) }
 
 // Strings sorts a slice of strings in increasing order.
@@ -353,7 +316,8 @@ func Strings(a []string) { Sort(StringSlice(a)) }
 // IntsAreSorted tests whether a slice of ints is sorted in increasing order.
 func IntsAreSorted(a []int) bool { return IsSorted(IntSlice(a)) }
 
-// Float64sAreSorted tests whether a slice of float64s is sorted in increasing order.
+// Float64sAreSorted tests whether a slice of float64s is sorted in increasing order
+// (not-a-number values are treated as less than other values).
 func Float64sAreSorted(a []float64) bool { return IsSorted(Float64Slice(a)) }
 
 // StringsAreSorted tests whether a slice of strings is sorted in increasing order.

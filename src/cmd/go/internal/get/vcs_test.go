@@ -32,6 +32,14 @@ func TestRepoRootForImportPath(t *testing.T) {
 				repo: "https://github.com/golang/groupcache",
 			},
 		},
+		// Unicode letters in directories (issue 18660).
+		{
+			"github.com/user/unicode/испытание",
+			&repoRoot{
+				vcs:  vcsGit,
+				repo: "https://github.com/user/unicode",
+			},
+		},
 		// IBM DevOps Services tests
 		{
 			"hub.jazz.net/git/user1/pkgname",
@@ -146,6 +154,22 @@ func TestRepoRootForImportPath(t *testing.T) {
 				repo: "https://git.apache.org/package-name_2.x.git",
 			},
 		},
+		{
+			"chiselapp.com/user/kyle/repository/fossilgg",
+			&repoRoot{
+				vcs:  vcsFossil,
+				repo: "https://chiselapp.com/user/kyle/repository/fossilgg",
+			},
+		},
+		{
+			// must have a user/$name/repository/$repo path
+			"chiselapp.com/kyle/repository/fossilgg",
+			nil,
+		},
+		{
+			"chiselapp.com/user/kyle/fossilgg",
+			nil,
+		},
 	}
 
 	for _, test := range tests {
@@ -154,16 +178,16 @@ func TestRepoRootForImportPath(t *testing.T) {
 
 		if want == nil {
 			if err == nil {
-				t.Errorf("RepoRootForImport(%q): Error expected but not received", test.path)
+				t.Errorf("repoRootForImportPath(%q): Error expected but not received", test.path)
 			}
 			continue
 		}
 		if err != nil {
-			t.Errorf("RepoRootForImport(%q): %v", test.path, err)
+			t.Errorf("repoRootForImportPath(%q): %v", test.path, err)
 			continue
 		}
 		if got.vcs.name != want.vcs.name || got.repo != want.repo {
-			t.Errorf("RepoRootForImport(%q) = VCS(%s) Repo(%s), want VCS(%s) Repo(%s)", test.path, got.vcs, got.repo, want.vcs, want.repo)
+			t.Errorf("repoRootForImportPath(%q) = VCS(%s) Repo(%s), want VCS(%s) Repo(%s)", test.path, got.vcs, got.repo, want.vcs, want.repo)
 		}
 	}
 }
@@ -233,6 +257,8 @@ func TestIsSecure(t *testing.T) {
 		{vcsGit, "example.com:path/to/repo.git", false},
 		{vcsGit, "path/that/contains/a:colon/repo.git", false},
 		{vcsHg, "ssh://user@example.com/path/to/repo.hg", true},
+		{vcsFossil, "http://example.com/foo", false},
+		{vcsFossil, "https://example.com/foo", true},
 	}
 
 	for _, test := range tests {

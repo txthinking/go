@@ -213,10 +213,11 @@ func extractPadding(payload []byte) (toRemove int, good byte) {
 	// if len(payload) >= (paddingLen - 1) then the MSB of t is zero
 	good = byte(int32(^t) >> 31)
 
-	toCheck := 255 // the maximum possible padding length
+	// The maximum possible padding length plus the actual length field
+	toCheck := 256
 	// The length of the padded data is public, so we can use an if here
-	if toCheck+1 > len(payload) {
-		toCheck = len(payload) - 1
+	if toCheck > len(payload) {
+		toCheck = len(payload)
 	}
 
 	for i := 0; i < toCheck; i++ {
@@ -683,6 +684,11 @@ Again:
 
 	case recordTypeChangeCipherSpec:
 		if typ != want || len(data) != 1 || data[0] != 1 {
+			c.in.setErrorLocked(c.sendAlert(alertUnexpectedMessage))
+			break
+		}
+		// Handshake messages are not allowed to fragment across the CCS
+		if c.hand.Len() > 0 {
 			c.in.setErrorLocked(c.sendAlert(alertUnexpectedMessage))
 			break
 		}

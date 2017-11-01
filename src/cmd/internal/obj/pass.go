@@ -117,20 +117,20 @@ func checkaddr(ctxt *Link, p *Prog, a *Addr) {
 	ctxt.Diag("invalid encoding for argument %v", p)
 }
 
-func linkpatch(ctxt *Link, sym *LSym) {
+func linkpatch(ctxt *Link, sym *LSym, newprog ProgAlloc) {
 	var c int32
 	var name string
 	var q *Prog
 
-	for p := sym.Text; p != nil; p = p.Link {
+	for p := sym.Func.Text; p != nil; p = p.Link {
 		checkaddr(ctxt, p, &p.From)
-		if p.From3 != nil {
-			checkaddr(ctxt, p, p.From3)
+		if p.GetFrom3() != nil {
+			checkaddr(ctxt, p, p.GetFrom3())
 		}
 		checkaddr(ctxt, p, &p.To)
 
 		if ctxt.Arch.Progedit != nil {
-			ctxt.Arch.Progedit(ctxt, p)
+			ctxt.Arch.Progedit(ctxt, p, newprog)
 		}
 		if p.To.Type != TYPE_BRANCH {
 			continue
@@ -145,7 +145,7 @@ func linkpatch(ctxt *Link, sym *LSym) {
 			continue
 		}
 		c = int32(p.To.Offset)
-		for q = sym.Text; q != nil; {
+		for q = sym.Func.Text; q != nil; {
 			if int64(c) == q.Pc {
 				break
 			}
@@ -174,7 +174,7 @@ func linkpatch(ctxt *Link, sym *LSym) {
 	}
 
 	// Collapse series of jumps to jumps.
-	for p := sym.Text; p != nil; p = p.Link {
+	for p := sym.Func.Text; p != nil; p = p.Link {
 		if p.Pcond == nil {
 			continue
 		}

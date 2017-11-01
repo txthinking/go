@@ -49,6 +49,7 @@ var (
 	appID    string
 	teamID   string
 	bundleID string
+	deviceID string
 )
 
 // lock is a file lock to serialize iOS runs. It is global to avoid the
@@ -77,6 +78,9 @@ func main() {
 	// https://developer.apple.com/membercenter/index.action#accountSummary as Team ID.
 	teamID = getenv("GOIOS_TEAM_ID")
 
+	// Device IDs as listed with ios-deploy -c.
+	deviceID = os.Getenv("GOIOS_DEVICE_ID")
+
 	parts := strings.SplitN(appID, ".", 2)
 	// For compatibility with the old builders, use a fallback bundle ID
 	bundleID = "golang.gotest"
@@ -96,7 +100,7 @@ func main() {
 	//
 	// The lock file is never deleted, to avoid concurrent locks on distinct
 	// files with the same path.
-	lockName := filepath.Join(os.TempDir(), "go_darwin_arm_exec.lock")
+	lockName := filepath.Join(os.TempDir(), "go_darwin_arm_exec-"+deviceID+".lock")
 	lock, err = os.OpenFile(lockName, os.O_CREATE|os.O_RDONLY, 0666)
 	if err != nil {
 		log.Fatal(err)
@@ -294,7 +298,7 @@ func newSession(appdir string, args []string, opts options) (*lldbSession, error
 	if err != nil {
 		return nil, err
 	}
-	s.cmd = exec.Command(
+	cmdArgs := []string{
 		// lldb tries to be clever with terminals.
 		// So we wrap it in script(1) and be clever
 		// right back at it.
@@ -307,9 +311,13 @@ func newSession(appdir string, args []string, opts options) (*lldbSession, error
 		"-u",
 		"-r",
 		"-n",
-		`--args=`+strings.Join(args, " ")+``,
+		`--args=` + strings.Join(args, " ") + ``,
 		"--bundle", appdir,
-	)
+	}
+	if deviceID != "" {
+		cmdArgs = append(cmdArgs, "--id", deviceID)
+	}
+	s.cmd = exec.Command(cmdArgs[0], cmdArgs[1:]...)
 	if debug {
 		log.Println(strings.Join(s.cmd.Args, " "))
 	}
@@ -346,7 +354,7 @@ func newSession(appdir string, args []string, opts options) (*lldbSession, error
 		i2 := s.out.LastIndex([]byte(" connect"))
 		return i0 > 0 && i1 > 0 && i2 > 0
 	}
-	if err := s.wait("lldb start", cond, 10*time.Second); err != nil {
+	if err := s.wait("lldb start", cond, 15*time.Second); err != nil {
 		panic(waitPanic{err})
 	}
 	return s, nil
@@ -377,6 +385,9 @@ func (s *lldbSession) wait(reason string, cond func(out *buf) bool, extraTimeout
 			}
 			return fmt.Errorf("test timeout (%s)", reason)
 		case <-doTimedout:
+			if p := s.cmd.Process; p != nil {
+				p.Kill()
+			}
 			return fmt.Errorf("command timeout (%s for %v)", reason, doTimeout)
 		case err := <-s.exited:
 			return fmt.Errorf("exited (%s: %v)", reason, err)
@@ -517,16 +528,29 @@ func copyLocalData(dstbase string) (pkgpath string, err error) {
 		}
 	}
 
-	// Copy timezone file.
-	//
-	// Typical apps have the zoneinfo.zip in the root of their app bundle,
-	// read by the time package as the working directory at initialization.
-	// As we move the working directory to the GOROOT pkg directory, we
-	// install the zoneinfo.zip file in the pkgpath.
 	if underGoRoot {
+		// Copy timezone file.
+		//
+		// Typical apps have the zoneinfo.zip in the root of their app bundle,
+		// read by the time package as the working directory at initialization.
+		// As we move the working directory to the GOROOT pkg directory, we
+		// install the zoneinfo.zip file in the pkgpath.
 		err := cp(
 			filepath.Join(dstbase, pkgpath),
 			filepath.Join(cwd, "lib", "time", "zoneinfo.zip"),
+		)
+		if err != nil {
+			return "", err
+		}
+		// Copy src/runtime/textflag.h for (at least) Test386EndToEnd in
+		// cmd/asm/internal/asm.
+		runtimePath := filepath.Join(dstbase, "src", "runtime")
+		if err := os.MkdirAll(runtimePath, 0755); err != nil {
+			return "", err
+		}
+		err = cp(
+			filepath.Join(runtimePath, "textflag.h"),
+			filepath.Join(cwd, "src", "runtime", "textflag.h"),
 		)
 		if err != nil {
 			return "", err

@@ -47,26 +47,25 @@ type typeAlg struct {
 func memhash0(p unsafe.Pointer, h uintptr) uintptr {
 	return h
 }
+
 func memhash8(p unsafe.Pointer, h uintptr) uintptr {
 	return memhash(p, h, 1)
 }
+
 func memhash16(p unsafe.Pointer, h uintptr) uintptr {
 	return memhash(p, h, 2)
 }
-func memhash32(p unsafe.Pointer, h uintptr) uintptr {
-	return memhash(p, h, 4)
-}
-func memhash64(p unsafe.Pointer, h uintptr) uintptr {
-	return memhash(p, h, 8)
-}
+
 func memhash128(p unsafe.Pointer, h uintptr) uintptr {
 	return memhash(p, h, 16)
 }
 
-// memhash_varlen is defined in assembly because it needs access
-// to the closure. It appears here to provide an argument
-// signature for the assembly routine.
-func memhash_varlen(p unsafe.Pointer, h uintptr) uintptr
+//go:nosplit
+func memhash_varlen(p unsafe.Pointer, h uintptr) uintptr {
+	ptr := getclosureptr()
+	size := *(*uintptr)(unsafe.Pointer(ptr + unsafe.Sizeof(h)))
+	return memhash(p, h, size)
+}
 
 var algarray = [alg_max]typeAlg{
 	alg_NOEQ:     {nil, nil},
@@ -283,9 +282,9 @@ func alginit() {
 	// Install aes hash algorithm if we have the instructions we need
 	if (GOARCH == "386" || GOARCH == "amd64") &&
 		GOOS != "nacl" &&
-		cpuid_ecx&(1<<25) != 0 && // aes (aesenc)
-		cpuid_ecx&(1<<9) != 0 && // sse3 (pshufb)
-		cpuid_ecx&(1<<19) != 0 { // sse4.1 (pinsr{d,q})
+		support_aes && // AESENC
+		support_ssse3 && // PSHUFB
+		support_sse41 { // PINSR{D,Q}
 		useAeshash = true
 		algarray[alg_MEM32].hash = aeshash32
 		algarray[alg_MEM64].hash = aeshash64

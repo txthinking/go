@@ -31,11 +31,40 @@ var (
 // package uses CancelIoEx API, if present, otherwise it fallback
 // to CancelIo.
 
-var (
-	canCancelIO                               bool // determines if CancelIoEx API is present
-	skipSyncNotif                             bool
-	hasLoadSetFileCompletionNotificationModes bool
-)
+var canCancelIO bool // determines if CancelIoEx API is present
+
+// This package uses SetFileCompletionNotificationModes Windows API
+// to skip calling GetQueuedCompletionStatus if an IO operation completes
+// synchronously. Unfortuently SetFileCompletionNotificationModes is not
+// available on Windows XP. Also there is a known bug where
+// SetFileCompletionNotificationModes crashes on some systems
+// (see http://support.microsoft.com/kb/2568167 for details).
+
+var useSetFileCompletionNotificationModes bool // determines is SetFileCompletionNotificationModes is present and safe to use
+
+// checkSetFileCompletionNotificationModes verifies that
+// SetFileCompletionNotificationModes Windows API is present
+// on the system and is safe to use.
+// See http://support.microsoft.com/kb/2568167 for details.
+func checkSetFileCompletionNotificationModes() {
+	err := syscall.LoadSetFileCompletionNotificationModes()
+	if err != nil {
+		return
+	}
+	protos := [2]int32{syscall.IPPROTO_TCP, 0}
+	var buf [32]syscall.WSAProtocolInfo
+	len := uint32(unsafe.Sizeof(buf))
+	n, err := syscall.WSAEnumProtocols(&protos[0], &buf[0], &len)
+	if err != nil {
+		return
+	}
+	for i := int32(0); i < n; i++ {
+		if buf[i].ServiceFlags1&syscall.XP1_IFS_HANDLES == 0 {
+			return
+		}
+	}
+	useSetFileCompletionNotificationModes = true
+}
 
 func init() {
 	var d syscall.WSAData
@@ -44,26 +73,7 @@ func init() {
 		initErr = e
 	}
 	canCancelIO = syscall.LoadCancelIoEx() == nil
-	hasLoadSetFileCompletionNotificationModes = syscall.LoadSetFileCompletionNotificationModes() == nil
-	if hasLoadSetFileCompletionNotificationModes {
-		// It's not safe to use FILE_SKIP_COMPLETION_PORT_ON_SUCCESS if non IFS providers are installed:
-		// http://support.microsoft.com/kb/2568167
-		skipSyncNotif = true
-		protos := [2]int32{syscall.IPPROTO_TCP, 0}
-		var buf [32]syscall.WSAProtocolInfo
-		len := uint32(unsafe.Sizeof(buf))
-		n, err := syscall.WSAEnumProtocols(&protos[0], &buf[0], &len)
-		if err != nil {
-			skipSyncNotif = false
-		} else {
-			for i := int32(0); i < n; i++ {
-				if buf[i].ServiceFlags1&syscall.XP1_IFS_HANDLES == 0 {
-					skipSyncNotif = false
-					break
-				}
-			}
-		}
-	}
+	checkSetFileCompletionNotificationModes()
 }
 
 // operation contains superset of data necessary to perform all async IO.
@@ -153,14 +163,18 @@ func (s *ioSrv) ProcessRemoteIO() {
 // IO in the current thread for systems where Windows CancelIoEx API
 // is available. Alternatively, it passes the request onto
 // runtime netpoll and waits for completion or cancels request.
-func (s *ioSrv) ExecIO(o *operation, name string, submit func(o *operation) error) (int, error) {
+func (s *ioSrv) ExecIO(o *operation, submit func(o *operation) error) (int, error) {
+	if o.fd.pd.runtimeCtx == 0 {
+		return 0, errors.New("internal error: polling on unsupported descriptor type")
+	}
+
 	if !canCancelIO {
 		onceStartServer.Do(startServer)
 	}
 
 	fd := o.fd
 	// Notify runtime netpoll about starting IO.
-	err := fd.pd.prepare(int(o.mode))
+	err := fd.pd.prepare(int(o.mode), fd.isFile)
 	if err != nil {
 		return 0, err
 	}
@@ -188,7 +202,7 @@ func (s *ioSrv) ExecIO(o *operation, name string, submit func(o *operation) erro
 		return 0, err
 	}
 	// Wait for our request to complete.
-	err = fd.pd.wait(int(o.mode))
+	err = fd.pd.wait(int(o.mode), fd.isFile)
 	if err == nil {
 		// All is good. Extract our IO results and return.
 		if o.errno != 0 {
@@ -200,10 +214,10 @@ func (s *ioSrv) ExecIO(o *operation, name string, submit func(o *operation) erro
 	// IO is interrupted by "close" or "timeout"
 	netpollErr := err
 	switch netpollErr {
-	case ErrClosing, ErrTimeout:
+	case ErrNetClosing, ErrFileClosing, ErrTimeout:
 		// will deal with those.
 	default:
-		panic("net: unexpected runtime.netpoll error: " + netpollErr.Error())
+		panic("unexpected runtime.netpoll error: " + netpollErr.Error())
 	}
 	// Cancel our request.
 	if canCancelIO {
@@ -274,6 +288,9 @@ type FD struct {
 	readbyte       []byte   // buffer to hold decoding of readuint16 from utf16 to utf8
 	readbyteOffset int      // readbyte[readOffset:] is yet to be consumed with file.Read
 
+	// Semaphore signaled when file is closed.
+	csema uint32
+
 	skipSyncNotif bool
 
 	// Whether this is a streaming descriptor, as opposed to a
@@ -291,11 +308,15 @@ type FD struct {
 	isDir bool
 }
 
+// logInitFD is set by tests to enable file descriptor initialization logging.
+var logInitFD func(net string, fd *FD, err error)
+
 // Init initializes the FD. The Sysfd field should already be set.
 // This can be called multiple times on a single FD.
 // The net argument is a network name from the net package (e.g., "tcp"),
 // or "file" or "console" or "dir".
-func (fd *FD) Init(net string) (string, error) {
+// Set pollable to true if fd should be managed by runtime netpoll.
+func (fd *FD) Init(net string, pollable bool) (string, error) {
 	if initErr != nil {
 		return "", initErr
 	}
@@ -315,15 +336,33 @@ func (fd *FD) Init(net string) (string, error) {
 		return "", errors.New("internal error: unknown network type " + net)
 	}
 
-	if err := fd.pd.init(fd); err != nil {
+	var err error
+	if pollable {
+		// Only call init for a network socket.
+		// This means that we don't add files to the runtime poller.
+		// Adding files to the runtime poller can confuse matters
+		// if the user is doing their own overlapped I/O.
+		// See issue #21172.
+		//
+		// In general the code below avoids calling the ExecIO
+		// method for non-network sockets. If some method does
+		// somehow call ExecIO, then ExecIO, and therefore the
+		// calling method, will return an error, because
+		// fd.pd.runtimeCtx will be 0.
+		err = fd.pd.init(fd)
+	}
+	if logInitFD != nil {
+		logInitFD(net, fd, err)
+	}
+	if err != nil {
 		return "", err
 	}
-	if hasLoadSetFileCompletionNotificationModes {
+	if pollable && useSetFileCompletionNotificationModes {
 		// We do not use events, so we can skip them always.
 		flags := uint8(syscall.FILE_SKIP_SET_EVENT_ON_HANDLE)
 		// It's not safe to skip completion notifications for UDP:
 		// http://blogs.technet.com/b/winserverperformance/archive/2008/06/26/designing-applications-for-high-performance-part-iii.aspx
-		if skipSyncNotif && (net == "tcp" || net == "file") {
+		if net == "tcp" {
 			flags |= syscall.FILE_SKIP_COMPLETION_PORT_ON_SUCCESS
 		}
 		err := syscall.SetFileCompletionNotificationModes(fd.Sysfd, flags)
@@ -373,18 +412,26 @@ func (fd *FD) destroy() error {
 		err = CloseFunc(fd.Sysfd)
 	}
 	fd.Sysfd = syscall.InvalidHandle
+	runtime_Semrelease(&fd.csema)
 	return err
 }
 
+// Close closes the FD. The underlying file descriptor is closed by
+// the destroy method when there are no remaining references.
 func (fd *FD) Close() error {
 	if !fd.fdmu.increfAndClose() {
-		return ErrClosing
+		return errClosing(fd.isFile)
 	}
 	// unblock pending reader and writer
 	fd.pd.evict()
-	return fd.decref()
+	err := fd.decref()
+	// Wait until the descriptor is closed. If this was the only
+	// reference, it is already closed.
+	runtime_Semacquire(&fd.csema)
+	return err
 }
 
+// Shutdown wraps the shutdown network call.
 func (fd *FD) Shutdown(how int) error {
 	if err := fd.incref(); err != nil {
 		return err
@@ -393,6 +440,7 @@ func (fd *FD) Shutdown(how int) error {
 	return syscall.Shutdown(fd.Sysfd, how)
 }
 
+// Read implements io.Reader.
 func (fd *FD) Read(buf []byte) (int, error) {
 	if err := fd.readLock(); err != nil {
 		return 0, err
@@ -415,7 +463,7 @@ func (fd *FD) Read(buf []byte) (int, error) {
 	} else {
 		o := &fd.rop
 		o.InitBuf(buf)
-		n, err = rsrv.ExecIO(o, "WSARecv", func(o *operation) error {
+		n, err = rsrv.ExecIO(o, func(o *operation) error {
 			return syscall.WSARecv(o.fd.Sysfd, &o.buf, 1, &o.qty, &o.flags, &o.o, nil)
 		})
 		if race.Enabled {
@@ -503,11 +551,14 @@ func (fd *FD) readConsole(b []byte) (int, error) {
 	return i, nil
 }
 
+// Pread emulates the Unix pread system call.
 func (fd *FD) Pread(b []byte, off int64) (int, error) {
-	if err := fd.readLock(); err != nil {
+	// Call incref, not readLock, because since pread specifies the
+	// offset it is independent from other reads.
+	if err := fd.incref(); err != nil {
 		return 0, err
 	}
-	defer fd.readUnlock()
+	defer fd.decref()
 
 	fd.l.Lock()
 	defer fd.l.Unlock()
@@ -534,7 +585,8 @@ func (fd *FD) Pread(b []byte, off int64) (int, error) {
 	return int(done), e
 }
 
-func (fd *FD) RecvFrom(buf []byte) (int, syscall.Sockaddr, error) {
+// ReadFrom wraps the recvfrom network call.
+func (fd *FD) ReadFrom(buf []byte) (int, syscall.Sockaddr, error) {
 	if len(buf) == 0 {
 		return 0, nil, nil
 	}
@@ -544,7 +596,7 @@ func (fd *FD) RecvFrom(buf []byte) (int, syscall.Sockaddr, error) {
 	defer fd.readUnlock()
 	o := &fd.rop
 	o.InitBuf(buf)
-	n, err := rsrv.ExecIO(o, "WSARecvFrom", func(o *operation) error {
+	n, err := rsrv.ExecIO(o, func(o *operation) error {
 		if o.rsa == nil {
 			o.rsa = new(syscall.RawSockaddrAny)
 		}
@@ -559,6 +611,7 @@ func (fd *FD) RecvFrom(buf []byte) (int, syscall.Sockaddr, error) {
 	return n, sa, nil
 }
 
+// Write implements io.Writer.
 func (fd *FD) Write(buf []byte) (int, error) {
 	if err := fd.writeLock(); err != nil {
 		return 0, err
@@ -584,7 +637,7 @@ func (fd *FD) Write(buf []byte) (int, error) {
 		}
 		o := &fd.wop
 		o.InitBuf(buf)
-		n, err = wsrv.ExecIO(o, "WSASend", func(o *operation) error {
+		n, err = wsrv.ExecIO(o, func(o *operation) error {
 			return syscall.WSASend(o.fd.Sysfd, &o.buf, 1, &o.qty, 0, &o.o, nil)
 		})
 	}
@@ -634,11 +687,14 @@ func (fd *FD) writeConsole(b []byte) (int, error) {
 	return n, nil
 }
 
+// Pwrite emulates the Unix pwrite system call.
 func (fd *FD) Pwrite(b []byte, off int64) (int, error) {
-	if err := fd.writeLock(); err != nil {
+	// Call incref, not writeLock, because since pwrite specifies the
+	// offset it is independent from other writes.
+	if err := fd.incref(); err != nil {
 		return 0, err
 	}
-	defer fd.writeUnlock()
+	defer fd.decref()
 
 	fd.l.Lock()
 	defer fd.l.Unlock()
@@ -659,6 +715,7 @@ func (fd *FD) Pwrite(b []byte, off int64) (int, error) {
 	return int(done), nil
 }
 
+// Writev emulates the Unix writev system call.
 func (fd *FD) Writev(buf *[][]byte) (int64, error) {
 	if len(*buf) == 0 {
 		return 0, nil
@@ -672,8 +729,8 @@ func (fd *FD) Writev(buf *[][]byte) (int64, error) {
 	}
 	o := &fd.wop
 	o.InitBufs(buf)
-	n, err := wsrv.ExecIO(o, "WSASend", func(o *operation) error {
-		return syscall.WSASend(o.fd.Sysfd, &o.bufs[0], uint32(len(*buf)), &o.qty, 0, &o.o, nil)
+	n, err := wsrv.ExecIO(o, func(o *operation) error {
+		return syscall.WSASend(o.fd.Sysfd, &o.bufs[0], uint32(len(o.bufs)), &o.qty, 0, &o.o, nil)
 	})
 	o.ClearBufs()
 	TestHookDidWritev(n)
@@ -681,6 +738,7 @@ func (fd *FD) Writev(buf *[][]byte) (int64, error) {
 	return int64(n), err
 }
 
+// WriteTo wraps the sendto network call.
 func (fd *FD) WriteTo(buf []byte, sa syscall.Sockaddr) (int, error) {
 	if len(buf) == 0 {
 		return 0, nil
@@ -692,7 +750,7 @@ func (fd *FD) WriteTo(buf []byte, sa syscall.Sockaddr) (int, error) {
 	o := &fd.wop
 	o.InitBuf(buf)
 	o.sa = sa
-	n, err := wsrv.ExecIO(o, "WSASendto", func(o *operation) error {
+	n, err := wsrv.ExecIO(o, func(o *operation) error {
 		return syscall.WSASendto(o.fd.Sysfd, &o.buf, 1, &o.qty, 0, o.sa, &o.o, nil)
 	})
 	return n, err
@@ -704,7 +762,7 @@ func (fd *FD) WriteTo(buf []byte, sa syscall.Sockaddr) (int, error) {
 func (fd *FD) ConnectEx(ra syscall.Sockaddr) error {
 	o := &fd.wop
 	o.sa = ra
-	_, err := wsrv.ExecIO(o, "ConnectEx", func(o *operation) error {
+	_, err := wsrv.ExecIO(o, func(o *operation) error {
 		return ConnectExFunc(o.fd.Sysfd, o.sa, nil, 0, nil, &o.o)
 	})
 	return err
@@ -714,7 +772,7 @@ func (fd *FD) acceptOne(s syscall.Handle, rawsa []syscall.RawSockaddrAny, o *ope
 	// Submit accept request.
 	o.handle = s
 	o.rsan = int32(unsafe.Sizeof(rawsa[0]))
-	_, err := rsrv.ExecIO(o, "AcceptEx", func(o *operation) error {
+	_, err := rsrv.ExecIO(o, func(o *operation) error {
 		return AcceptFunc(o.fd.Sysfd, o.handle, (*byte)(unsafe.Pointer(&rawsa[0])), 0, uint32(o.rsan), uint32(o.rsan), &o.qty, &o.o)
 	})
 	if err != nil {
@@ -771,6 +829,7 @@ func (fd *FD) Accept(sysSocket func() (syscall.Handle, error)) (syscall.Handle, 
 	}
 }
 
+// Seek wraps syscall.Seek.
 func (fd *FD) Seek(offset int64, whence int) (int64, error) {
 	if err := fd.incref(); err != nil {
 		return 0, err
@@ -801,6 +860,7 @@ func (fd *FD) Fchdir() error {
 	return syscall.Fchdir(fd.Sysfd)
 }
 
+// GetFileType wraps syscall.GetFileType.
 func (fd *FD) GetFileType() (uint32, error) {
 	if err := fd.incref(); err != nil {
 		return 0, err
@@ -809,10 +869,32 @@ func (fd *FD) GetFileType() (uint32, error) {
 	return syscall.GetFileType(fd.Sysfd)
 }
 
+// GetFileInformationByHandle wraps GetFileInformationByHandle.
 func (fd *FD) GetFileInformationByHandle(data *syscall.ByHandleFileInformation) error {
 	if err := fd.incref(); err != nil {
 		return err
 	}
 	defer fd.decref()
 	return syscall.GetFileInformationByHandle(fd.Sysfd, data)
+}
+
+// RawControl invokes the user-defined function f for a non-IO
+// operation.
+func (fd *FD) RawControl(f func(uintptr)) error {
+	if err := fd.incref(); err != nil {
+		return err
+	}
+	defer fd.decref()
+	f(uintptr(fd.Sysfd))
+	return nil
+}
+
+// RawRead invokes the user-defined function f for a read operation.
+func (fd *FD) RawRead(f func(uintptr) bool) error {
+	return errors.New("not implemented")
+}
+
+// RawWrite invokes the user-defined function f for a write operation.
+func (fd *FD) RawWrite(f func(uintptr) bool) error {
+	return errors.New("not implemented")
 }

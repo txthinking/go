@@ -12,7 +12,8 @@ import (
 
 func TestLinkgetlineFromPos(t *testing.T) {
 	ctxt := new(Link)
-	ctxt.Hash = make(map[SymVer]*LSym)
+	ctxt.hash = make(map[string]*LSym)
+	ctxt.statichash = make(map[string]*LSym)
 
 	afile := src.NewFileBase("a.go", "a.go")
 	bfile := src.NewFileBase("b.go", "/foo/bar/b.go")
@@ -31,7 +32,7 @@ func TestLinkgetlineFromPos(t *testing.T) {
 
 	for _, test := range tests {
 		f, l := linkgetlineFromPos(ctxt, ctxt.PosTable.XPos(test.pos))
-		got := fmt.Sprintf("%s:%d", f.Name, l)
+		got := fmt.Sprintf("%s:%d", f, l)
 		if got != src.FileSymPrefix+test.want {
 			t.Errorf("linkgetline(%v) = %q, want %q", test.pos, got, test.want)
 		}

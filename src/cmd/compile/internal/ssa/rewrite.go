@@ -5,28 +5,17 @@
 package ssa
 
 import (
+	"cmd/compile/internal/types"
 	"cmd/internal/obj"
-	"crypto/sha1"
 	"fmt"
+	"io"
 	"math"
 	"os"
 	"path/filepath"
-	"strings"
 )
 
 func applyRewrite(f *Func, rb blockRewriter, rv valueRewriter) {
 	// repeat rewrites until we find no more rewrites
-	var curb *Block
-	var curv *Value
-	defer func() {
-		if curb != nil {
-			curb.Fatalf("panic during rewrite of block %s\n", curb.LongString())
-		}
-		if curv != nil {
-			curv.Fatalf("panic during rewrite of value %s\n", curv.LongString())
-			// TODO(khr): print source location also
-		}
-	}()
 	for {
 		change := false
 		for _, b := range f.Blocks {
@@ -35,11 +24,9 @@ func applyRewrite(f *Func, rb blockRewriter, rv valueRewriter) {
 					b.SetControl(b.Control.Args[0])
 				}
 			}
-			curb = b
 			if rb(b) {
 				change = true
 			}
-			curb = nil
 			for _, v := range b.Values {
 				change = phielimValue(v) || change
 
@@ -64,11 +51,9 @@ func applyRewrite(f *Func, rb blockRewriter, rv valueRewriter) {
 				}
 
 				// apply rewrite function
-				curv = v
 				if rv(v) {
 					change = true
 				}
-				curv = nil
 			}
 		}
 		if !change {
@@ -100,39 +85,39 @@ func applyRewrite(f *Func, rb blockRewriter, rv valueRewriter) {
 
 // Common functions called from rewriting rules
 
-func is64BitFloat(t Type) bool {
+func is64BitFloat(t *types.Type) bool {
 	return t.Size() == 8 && t.IsFloat()
 }
 
-func is32BitFloat(t Type) bool {
+func is32BitFloat(t *types.Type) bool {
 	return t.Size() == 4 && t.IsFloat()
 }
 
-func is64BitInt(t Type) bool {
+func is64BitInt(t *types.Type) bool {
 	return t.Size() == 8 && t.IsInteger()
 }
 
-func is32BitInt(t Type) bool {
+func is32BitInt(t *types.Type) bool {
 	return t.Size() == 4 && t.IsInteger()
 }
 
-func is16BitInt(t Type) bool {
+func is16BitInt(t *types.Type) bool {
 	return t.Size() == 2 && t.IsInteger()
 }
 
-func is8BitInt(t Type) bool {
+func is8BitInt(t *types.Type) bool {
 	return t.Size() == 1 && t.IsInteger()
 }
 
-func isPtr(t Type) bool {
+func isPtr(t *types.Type) bool {
 	return t.IsPtrShaped()
 }
 
-func isSigned(t Type) bool {
+func isSigned(t *types.Type) bool {
 	return t.IsSigned()
 }
 
-func typeSize(t Type) int64 {
+func typeSize(t *types.Type) int64 {
 	return t.Size()
 }
 
@@ -226,6 +211,8 @@ search:
 		}
 		if v.Op == OpPhi {
 			// A Phi implies we have reached the top of the block.
+			// The memory phi, if it exists, is always
+			// the first logical store in the block.
 			continue search
 		}
 		if v.Type.IsTuple() && v.Type.FieldType(1).IsMemory() {
@@ -243,6 +230,8 @@ search:
 				const limit = 50
 				for i := 0; i < limit; i++ {
 					if m.Op == OpPhi {
+						// The memory phi, if it exists, is always
+						// the first logical store in the block.
 						break
 					}
 					if m.Block.ID != target.Block.ID {
@@ -287,18 +276,6 @@ search:
 	return true
 }
 
-// isArg returns whether s is an arg symbol
-func isArg(s interface{}) bool {
-	_, ok := s.(*ArgSymbol)
-	return ok
-}
-
-// isAuto returns whether s is an auto symbol
-func isAuto(s interface{}) bool {
-	_, ok := s.(*AutoSymbol)
-	return ok
-}
-
 // isSameSym returns whether sym is the same as the given named symbol
 func isSameSym(sym interface{}, name string) bool {
 	s, ok := sym.(fmt.Stringer)
@@ -314,6 +291,10 @@ func nlz(x int64) int64 {
 // ntz returns the number of trailing zeros.
 func ntz(x int64) int64 {
 	return 64 - nlz(^x&(x-1))
+}
+
+func oneBit(x int64) bool {
+	return nlz(x)+ntz(x) == 63
 }
 
 // nlo returns the number of leading ones.
@@ -367,6 +348,11 @@ func is16Bit(n int64) bool {
 	return n == int64(int16(n))
 }
 
+// isU12Bit reports whether n can be represented as an unsigned 12 bit integer.
+func isU12Bit(n int64) bool {
+	return 0 <= n && n < (1<<12)
+}
+
 // isU16Bit reports whether n can be represented as an unsigned 16 bit integer.
 func isU16Bit(n int64) bool {
 	return n == int64(uint16(n))
@@ -414,11 +400,11 @@ func uaddOvf(a, b int64) bool {
 // 'sym' is the symbol for the itab
 func devirt(v *Value, sym interface{}, offset int64) *obj.LSym {
 	f := v.Block.Func
-	ext, ok := sym.(*ExternSymbol)
+	n, ok := sym.(*obj.LSym)
 	if !ok {
 		return nil
 	}
-	lsym := f.fe.DerefItab(ext.Sym, offset)
+	lsym := f.fe.DerefItab(n, offset)
 	if f.pass.debug > 0 {
 		if lsym != nil {
 			f.Warnl(v.Pos, "de-virtualizing call")
@@ -453,7 +439,7 @@ func isSamePtr(p1, p2 *Value) bool {
 // moveSize returns the number of bytes an aligned MOV instruction moves
 func moveSize(align int64, c *Config) int64 {
 	switch {
-	case align%8 == 0 && c.IntSize == 8:
+	case align%8 == 0 && c.PtrSize == 8:
 		return 8
 	case align%4 == 0:
 		return 4
@@ -564,7 +550,7 @@ func logRule(s string) {
 	}
 }
 
-var ruleFile *os.File
+var ruleFile io.Writer
 
 func min(x, y int64) int64 {
 	if x < y {
@@ -573,26 +559,112 @@ func min(x, y int64) int64 {
 	return y
 }
 
-func experiment(f *Func) bool {
-	hstr := ""
-	for _, b := range sha1.Sum([]byte(f.Name)) {
-		hstr += fmt.Sprintf("%08b", b)
-	}
-	r := strings.HasSuffix(hstr, "00011")
-	_ = r
-	r = f.Name == "(*fmt).fmt_integer"
-	if r {
-		fmt.Printf("             enabled for %s\n", f.Name)
-	}
-	return r
-}
-
 func isConstZero(v *Value) bool {
 	switch v.Op {
 	case OpConstNil:
 		return true
 	case OpConst64, OpConst32, OpConst16, OpConst8, OpConstBool, OpConst32F, OpConst64F:
 		return v.AuxInt == 0
+	}
+	return false
+}
+
+// reciprocalExact64 reports whether 1/c is exactly representable.
+func reciprocalExact64(c float64) bool {
+	b := math.Float64bits(c)
+	man := b & (1<<52 - 1)
+	if man != 0 {
+		return false // not a power of 2, denormal, or NaN
+	}
+	exp := b >> 52 & (1<<11 - 1)
+	// exponent bias is 0x3ff.  So taking the reciprocal of a number
+	// changes the exponent to 0x7fe-exp.
+	switch exp {
+	case 0:
+		return false // ±0
+	case 0x7ff:
+		return false // ±inf
+	case 0x7fe:
+		return false // exponent is not representable
+	default:
+		return true
+	}
+}
+
+// reciprocalExact32 reports whether 1/c is exactly representable.
+func reciprocalExact32(c float32) bool {
+	b := math.Float32bits(c)
+	man := b & (1<<23 - 1)
+	if man != 0 {
+		return false // not a power of 2, denormal, or NaN
+	}
+	exp := b >> 23 & (1<<8 - 1)
+	// exponent bias is 0x7f.  So taking the reciprocal of a number
+	// changes the exponent to 0xfe-exp.
+	switch exp {
+	case 0:
+		return false // ±0
+	case 0xff:
+		return false // ±inf
+	case 0xfe:
+		return false // exponent is not representable
+	default:
+		return true
+	}
+}
+
+// check if an immediate can be directly encoded into an ARM's instruction
+func isARMImmRot(v uint32) bool {
+	for i := 0; i < 16; i++ {
+		if v&^0xff == 0 {
+			return true
+		}
+		v = v<<2 | v>>30
+	}
+
+	return false
+}
+
+// overlap reports whether the ranges given by the given offset and
+// size pairs overlap.
+func overlap(offset1, size1, offset2, size2 int64) bool {
+	if offset1 >= offset2 && offset2+size2 > offset1 {
+		return true
+	}
+	if offset2 >= offset1 && offset1+size1 > offset2 {
+		return true
+	}
+	return false
+}
+
+// check if value zeroes out upper 32-bit of 64-bit register.
+// depth limits recursion depth. In AMD64.rules 3 is used as limit,
+// because it catches same amount of cases as 4.
+func zeroUpper32Bits(x *Value, depth int) bool {
+	switch x.Op {
+	case OpAMD64MOVLconst, OpAMD64MOVLload, OpAMD64MOVLQZX, OpAMD64MOVLloadidx1,
+		OpAMD64MOVWload, OpAMD64MOVWloadidx1, OpAMD64MOVBload, OpAMD64MOVBloadidx1,
+		OpAMD64MOVLloadidx4, OpAMD64ADDLmem, OpAMD64SUBLmem, OpAMD64ANDLmem,
+		OpAMD64ORLmem, OpAMD64XORLmem, OpAMD64CVTTSD2SL,
+		OpAMD64ADDL, OpAMD64ADDLconst, OpAMD64SUBL, OpAMD64SUBLconst,
+		OpAMD64ANDL, OpAMD64ANDLconst, OpAMD64ORL, OpAMD64ORLconst,
+		OpAMD64XORL, OpAMD64XORLconst, OpAMD64NEGL, OpAMD64NOTL:
+		return true
+	case OpArg, OpSelect0, OpSelect1:
+		return x.Type.Width == 4
+	case OpPhi:
+		// Phis can use each-other as an arguments, instead of tracking visited values,
+		// just limit recursion depth.
+		if depth <= 0 {
+			return false
+		}
+		for i := range x.Args {
+			if !zeroUpper32Bits(x.Args[i], depth-1) {
+				return false
+			}
+		}
+		return true
+
 	}
 	return false
 }

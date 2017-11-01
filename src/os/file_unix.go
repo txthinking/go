@@ -20,11 +20,22 @@ func fixLongPath(path string) string {
 func rename(oldname, newname string) error {
 	fi, err := Lstat(newname)
 	if err == nil && fi.IsDir() {
+		// There are two independent errors this function can return:
+		// one for a bad oldname, and one for a bad newname.
+		// At this point we've determined the newname is bad.
+		// But just in case oldname is also bad, prioritize returning
+		// the oldname error because that's what we did historically.
+		if _, err := Lstat(oldname); err != nil {
+			if pe, ok := err.(*PathError); ok {
+				err = pe.Err
+			}
+			return &LinkError{"rename", oldname, newname, err}
+		}
 		return &LinkError{"rename", oldname, newname, syscall.EEXIST}
 	}
-	e := syscall.Rename(oldname, newname)
-	if e != nil {
-		return &LinkError{"rename", oldname, newname, e}
+	err = syscall.Rename(oldname, newname)
+	if err != nil {
+		return &LinkError{"rename", oldname, newname, err}
 	}
 	return nil
 }
@@ -34,10 +45,11 @@ func rename(oldname, newname string) error {
 // can overwrite this data, which could cause the finalizer
 // to close the wrong file descriptor.
 type file struct {
-	pfd      poll.FD
-	name     string
-	dirinfo  *dirInfo // nil unless directory being read
-	nonblock bool     // whether we set nonblocking mode
+	pfd         poll.FD
+	name        string
+	dirinfo     *dirInfo // nil unless directory being read
+	nonblock    bool     // whether we set nonblocking mode
+	stdoutOrErr bool     // whether this is stdout or stderr
 }
 
 // Fd returns the integer Unix file descriptor referencing the open file.
@@ -59,14 +71,26 @@ func (f *File) Fd() uintptr {
 	return uintptr(f.pfd.Sysfd)
 }
 
-// NewFile returns a new File with the given file descriptor and name.
+// NewFile returns a new File with the given file descriptor and
+// name. The returned value will be nil if fd is not a valid file
+// descriptor.
 func NewFile(fd uintptr, name string) *File {
-	return newFile(fd, name, false)
+	return newFile(fd, name, kindNewFile)
 }
 
-// newFile is like NewFile, but if pollable is true it tries to add the
-// file to the runtime poller.
-func newFile(fd uintptr, name string, pollable bool) *File {
+// newFileKind describes the kind of file to newFile.
+type newFileKind int
+
+const (
+	kindNewFile newFileKind = iota
+	kindOpenFile
+	kindPipe
+)
+
+// newFile is like NewFile, but if called from OpenFile or Pipe
+// (as passed in the kind parameter) it tries to add the file to
+// the runtime poller.
+func newFile(fd uintptr, name string, kind newFileKind) *File {
 	fdi := int(fd)
 	if fdi < 0 {
 		return nil
@@ -77,30 +101,30 @@ func newFile(fd uintptr, name string, pollable bool) *File {
 			IsStream:      true,
 			ZeroReadIsEOF: true,
 		},
-		name: name,
+		name:        name,
+		stdoutOrErr: fdi == 1 || fdi == 2,
 	}}
 
 	// Don't try to use kqueue with regular files on FreeBSD.
 	// It crashes the system unpredictably while running all.bash.
 	// Issue 19093.
-	if runtime.GOOS == "freebsd" {
-		pollable = false
+	if runtime.GOOS == "freebsd" && kind == kindOpenFile {
+		kind = kindNewFile
 	}
 
-	if pollable {
-		if err := f.pfd.Init(); err != nil {
-			// An error here indicates a failure to register
-			// with the netpoll system. That can happen for
-			// a file descriptor that is not supported by
-			// epoll/kqueue; for example, disk files on
-			// GNU/Linux systems. We assume that any real error
-			// will show up in later I/O.
-		} else {
-			// We successfully registered with netpoll, so put
-			// the file into nonblocking mode.
-			if err := syscall.SetNonblock(fdi, true); err == nil {
-				f.nonblock = true
-			}
+	pollable := kind == kindOpenFile || kind == kindPipe
+	if err := f.pfd.Init("file", pollable); err != nil {
+		// An error here indicates a failure to register
+		// with the netpoll system. That can happen for
+		// a file descriptor that is not supported by
+		// epoll/kqueue; for example, disk files on
+		// GNU/Linux systems. We assume that any real error
+		// will show up in later I/O.
+	} else if pollable {
+		// We successfully registered with netpoll, so put
+		// the file into nonblocking mode.
+		if err := syscall.SetNonblock(fdi, true); err == nil {
+			f.nonblock = true
 		}
 	}
 
@@ -119,7 +143,7 @@ type dirInfo struct {
 // output or standard error. See the SIGPIPE docs in os/signal, and
 // issue 11845.
 func epipecheck(file *File, e error) {
-	if e == syscall.EPIPE && (file.pfd.Sysfd == 1 || file.pfd.Sysfd == 2) {
+	if e == syscall.EPIPE && file.stdoutOrErr {
 		sigpipe()
 	}
 }
@@ -170,7 +194,7 @@ func OpenFile(name string, flag int, perm FileMode) (*File, error) {
 		syscall.CloseOnExec(r)
 	}
 
-	return newFile(uintptr(r), name, true), nil
+	return newFile(uintptr(r), name, kindOpenFile), nil
 }
 
 // Close closes the File, rendering it unusable for I/O.
@@ -183,14 +207,16 @@ func (f *File) Close() error {
 }
 
 func (file *file) close() error {
-	if file == nil || file.pfd.Sysfd == badFd {
+	if file == nil {
 		return syscall.EINVAL
 	}
 	var err error
 	if e := file.pfd.Close(); e != nil {
+		if e == poll.ErrFileClosing {
+			e = ErrClosed
+		}
 		err = &PathError{"close", file.name, e}
 	}
-	file.pfd.Sysfd = badFd // so it can't be closed again
 
 	// no need for a finalizer anymore
 	runtime.SetFinalizer(file, nil)
@@ -281,8 +307,7 @@ func Remove(name string) error {
 	return &PathError{"remove", name, e}
 }
 
-// TempDir returns the default directory to use for temporary files.
-func TempDir() string {
+func tempDir() string {
 	dir := Getenv("TMPDIR")
 	if dir == "" {
 		if runtime.GOOS == "android" {

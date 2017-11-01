@@ -292,7 +292,10 @@ func defaultContext() Context {
 	// say "+build go1.x", and code that should only be built before Go 1.x
 	// (perhaps it is the stub to use in that case) should say "+build !go1.x".
 	// NOTE: If you add to this list, also update the doc comment in doc.go.
-	c.ReleaseTags = []string{"go1.1", "go1.2", "go1.3", "go1.4", "go1.5", "go1.6", "go1.7", "go1.8", "go1.9"}
+	const version = 10 // go1.10
+	for i := 1; i <= version; i++ {
+		c.ReleaseTags = append(c.ReleaseTags, "go1."+strconv.Itoa(i))
+	}
 
 	env := os.Getenv("CGO_ENABLED")
 	if env == "" {
@@ -529,10 +532,7 @@ func (ctxt *Context) Import(path string, srcDir string, mode ImportMode) (*Packa
 		if !ctxt.isAbsPath(path) {
 			p.Dir = ctxt.joinPath(srcDir, path)
 		}
-		if !ctxt.isDir(p.Dir) {
-			// package was not found
-			return p, fmt.Errorf("cannot find package %q in:\n\t%s", path, p.Dir)
-		}
+		// p.Dir directory may or may not exist. Gather partial information first, check if it exists later.
 		// Determine canonical import path, if any.
 		// Exclude results where the import path would include /testdata/.
 		inTestdata := func(sub string) bool {
@@ -685,6 +685,16 @@ Found:
 			p.PkgTargetRoot = ctxt.joinPath(p.Root, pkgtargetroot)
 			p.PkgObj = ctxt.joinPath(p.Root, pkga)
 		}
+	}
+
+	// If it's a local import path, by the time we get here, we still haven't checked
+	// that p.Dir directory exists. This is the right time to do that check.
+	// We can't do it earlier, because we want to gather partial information for the
+	// non-nil *Package returned when an error occurs.
+	// We need to do this before we return early on FindOnly flag.
+	if IsLocalImport(path) && !ctxt.isDir(p.Dir) {
+		// package was not found
+		return p, fmt.Errorf("cannot find package %q in:\n\t%s", path, p.Dir)
 	}
 
 	if mode&FindOnly != 0 {
@@ -1188,24 +1198,25 @@ func (ctxt *Context) shouldBuild(content []byte, allTags map[string]bool, binary
 			p = p[len(p):]
 		}
 		line = bytes.TrimSpace(line)
-		if bytes.HasPrefix(line, slashslash) {
-			if bytes.Equal(line, binaryOnlyComment) {
-				sawBinaryOnly = true
-			}
-			line = bytes.TrimSpace(line[len(slashslash):])
-			if len(line) > 0 && line[0] == '+' {
-				// Looks like a comment +line.
-				f := strings.Fields(string(line))
-				if f[0] == "+build" {
-					ok := false
-					for _, tok := range f[1:] {
-						if ctxt.match(tok, allTags) {
-							ok = true
-						}
+		if !bytes.HasPrefix(line, slashslash) {
+			continue
+		}
+		if bytes.Equal(line, binaryOnlyComment) {
+			sawBinaryOnly = true
+		}
+		line = bytes.TrimSpace(line[len(slashslash):])
+		if len(line) > 0 && line[0] == '+' {
+			// Looks like a comment +line.
+			f := strings.Fields(string(line))
+			if f[0] == "+build" {
+				ok := false
+				for _, tok := range f[1:] {
+					if ctxt.match(tok, allTags) {
+						ok = true
 					}
-					if !ok {
-						allok = false
-					}
+				}
+				if !ok {
+					allok = false
 				}
 			}
 		}
@@ -1275,6 +1286,12 @@ func (ctxt *Context) saveCgo(filename string, di *Package, cg *ast.CommentGroup)
 		}
 
 		switch verb {
+		case "CFLAGS", "CPPFLAGS", "CXXFLAGS", "FFLAGS", "LDFLAGS":
+			// Change relative paths to absolute.
+			ctxt.makePathsAbsolute(args, di.Dir)
+		}
+
+		switch verb {
 		case "CFLAGS":
 			di.CgoCFLAGS = append(di.CgoCFLAGS, args...)
 		case "CPPFLAGS":
@@ -1302,18 +1319,48 @@ func expandSrcDir(str string, srcdir string) (string, bool) {
 	// to "/" before starting (eg: on windows).
 	srcdir = filepath.ToSlash(srcdir)
 
-	// Spaces are tolerated in ${SRCDIR}, but not anywhere else.
 	chunks := strings.Split(str, "${SRCDIR}")
 	if len(chunks) < 2 {
-		return str, safeCgoName(str, false)
+		return str, safeCgoName(str)
 	}
 	ok := true
 	for _, chunk := range chunks {
-		ok = ok && (chunk == "" || safeCgoName(chunk, false))
+		ok = ok && (chunk == "" || safeCgoName(chunk))
 	}
-	ok = ok && (srcdir == "" || safeCgoName(srcdir, true))
+	ok = ok && (srcdir == "" || safeCgoName(srcdir))
 	res := strings.Join(chunks, srcdir)
 	return res, ok && res != ""
+}
+
+// makePathsAbsolute looks for compiler options that take paths and
+// makes them absolute. We do this because through the 1.8 release we
+// ran the compiler in the package directory, so any relative -I or -L
+// options would be relative to that directory. In 1.9 we changed to
+// running the compiler in the build directory, to get consistent
+// build results (issue #19964). To keep builds working, we change any
+// relative -I or -L options to be absolute.
+//
+// Using filepath.IsAbs and filepath.Join here means the results will be
+// different on different systems, but that's OK: -I and -L options are
+// inherently system-dependent.
+func (ctxt *Context) makePathsAbsolute(args []string, srcDir string) {
+	nextPath := false
+	for i, arg := range args {
+		if nextPath {
+			if !filepath.IsAbs(arg) {
+				args[i] = filepath.Join(srcDir, arg)
+			}
+			nextPath = false
+		} else if strings.HasPrefix(arg, "-I") || strings.HasPrefix(arg, "-L") {
+			if len(arg) == 2 {
+				nextPath = true
+			} else {
+				if !filepath.IsAbs(arg[2:]) {
+					args[i] = arg[:2] + filepath.Join(srcDir, arg[2:])
+				}
+			}
+		}
+	}
 }
 
 // NOTE: $ is not safe for the shell, but it is allowed here because of linker options like -Wl,$ORIGIN.
@@ -1321,21 +1368,14 @@ func expandSrcDir(str string, srcdir string) (string, bool) {
 // See golang.org/issue/6038.
 // The @ is for OS X. See golang.org/issue/13720.
 // The % is for Jenkins. See golang.org/issue/16959.
-const safeString = "+-.,/0123456789=ABCDEFGHIJKLMNOPQRSTUVWXYZ_abcdefghijklmnopqrstuvwxyz:$@%"
-const safeSpaces = " "
+const safeString = "+-.,/0123456789=ABCDEFGHIJKLMNOPQRSTUVWXYZ_abcdefghijklmnopqrstuvwxyz:$@% "
 
-var safeBytes = []byte(safeSpaces + safeString)
-
-func safeCgoName(s string, spaces bool) bool {
+func safeCgoName(s string) bool {
 	if s == "" {
 		return false
 	}
-	safe := safeBytes
-	if !spaces {
-		safe = safe[len(safeSpaces):]
-	}
 	for i := 0; i < len(s); i++ {
-		if c := s[i]; c < utf8.RuneSelf && bytes.IndexByte(safe, c) < 0 {
+		if c := s[i]; c < utf8.RuneSelf && strings.IndexByte(safeString, c) < 0 {
 			return false
 		}
 	}

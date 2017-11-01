@@ -7,8 +7,10 @@ package gc
 import (
 	"bytes"
 	"internal/testenv"
+	"io/ioutil"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 )
@@ -40,6 +42,75 @@ func doTest(t *testing.T, filename string, kind string) {
 	}
 }
 
+// runGenTest runs a test-generator, then runs the generated test.
+// Generated test can either fail in compilation or execution.
+// The environment variable parameter(s) is passed to the run
+// of the generated test.
+func runGenTest(t *testing.T, filename, tmpname string, ev ...string) {
+	testenv.MustHaveGoRun(t)
+	var stdout, stderr bytes.Buffer
+	cmd := exec.Command("go", "run", filepath.Join("testdata", filename))
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+	if err := cmd.Run(); err != nil {
+		t.Fatalf("Failed: %v:\nOut: %s\nStderr: %s\n", err, &stdout, &stderr)
+	}
+	// Write stdout into a temporary file
+	tmpdir, ok := ioutil.TempDir("", tmpname)
+	if ok != nil {
+		t.Fatalf("Failed to create temporary directory")
+	}
+
+	rungo := filepath.Join(tmpdir, "run.go")
+	ok = ioutil.WriteFile(rungo, stdout.Bytes(), 0600)
+	if ok != nil {
+		t.Fatalf("Failed to create temporary file " + rungo)
+	}
+
+	stdout.Reset()
+	stderr.Reset()
+	// Execute compile+link+run instead of "go run" to avoid applying -gcflags=-d=ssa/check/on
+	// to the runtime (especially over and over and over).
+	// compile
+	cmd = exec.Command("go", "tool", "compile", "-d=ssa/check/on", "-o", filepath.Join(tmpdir, "run.a"), rungo)
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+	cmd.Env = append(cmd.Env, ev...)
+	err := cmd.Run()
+	if err == nil {
+		// link
+		cmd = exec.Command("go", "tool", "link", "-o", filepath.Join(tmpdir, "run.exe"), filepath.Join(tmpdir, "run.a"))
+		cmd.Stdout = &stdout
+		cmd.Stderr = &stderr
+		cmd.Env = append(cmd.Env, ev...)
+		err = cmd.Run()
+	}
+	if err == nil {
+		// run
+		cmd = exec.Command(filepath.Join(tmpdir, "run.exe"))
+		cmd.Stdout = &stdout
+		cmd.Stderr = &stderr
+		cmd.Env = append(cmd.Env, ev...)
+		err = cmd.Run()
+	}
+	if err != nil {
+		t.Fatalf("Failed: %v:\nOut: %s\nStderr: %s\n", err, &stdout, &stderr)
+	}
+	if s := stderr.String(); s != "" {
+		t.Errorf("Stderr = %s\nWant empty", s)
+	}
+	if s := stdout.String(); s != "" {
+		t.Errorf("Stdout = %s\nWant empty", s)
+	}
+}
+
+func TestGenFlowGraph(t *testing.T) {
+	runGenTest(t, "flowgraph_generator1.go", "ssa_fg_tmp1")
+	if runtime.GOOS != "windows" {
+		runGenTest(t, "flowgraph_generator1.go", "ssa_fg_tmp2", "GO_SSA_PHI_LOC_CUTOFF=0")
+	}
+}
+
 // TestShortCircuit tests OANDAND and OOROR expressions and short circuiting.
 func TestShortCircuit(t *testing.T) { runTest(t, "short.go") }
 
@@ -62,6 +133,9 @@ func TestArithmeticBoundary(t *testing.T) { runTest(t, "arithBoundary.go") }
 func TestArithmeticConst(t *testing.T) { runTest(t, "arithConst.go") }
 
 func TestChan(t *testing.T) { runTest(t, "chan.go") }
+
+// TestComparisonsConst tests results for comparison operations against constants.
+func TestComparisonsConst(t *testing.T) { runTest(t, "cmpConst.go") }
 
 func TestCompound(t *testing.T) { runTest(t, "compound.go") }
 

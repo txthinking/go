@@ -288,6 +288,27 @@ func TestCertificateParse(t *testing.T) {
 	}
 }
 
+func TestMismatchedSignatureAlgorithm(t *testing.T) {
+	der, _ := pem.Decode([]byte(rsaPSSSelfSignedPEM))
+	if der == nil {
+		t.Fatal("Failed to find PEM block")
+	}
+
+	cert, err := ParseCertificate(der.Bytes)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if err = cert.CheckSignature(ECDSAWithSHA256, nil, nil); err == nil {
+		t.Fatal("CheckSignature unexpectedly return no error")
+	}
+
+	const expectedSubstring = " but have public key of type "
+	if !strings.Contains(err.Error(), expectedSubstring) {
+		t.Errorf("Expected error containing %q, but got %q", expectedSubstring, err)
+	}
+}
+
 var certBytes = "308203223082028ba00302010202106edf0d9499fd4533dd1297fc42a93be1300d06092a864886" +
 	"f70d0101050500304c310b3009060355040613025a4131253023060355040a131c546861777465" +
 	"20436f6e73756c74696e67202850747929204c74642e311630140603550403130d546861777465" +
@@ -405,6 +426,7 @@ func TestCreateSelfSignedCertificate(t *testing.T) {
 
 			PolicyIdentifiers:   []asn1.ObjectIdentifier{[]int{1, 2, 3}},
 			PermittedDNSDomains: []string{".example.com", "example.com"},
+			ExcludedDNSDomains:  []string{"bar.example.com"},
 
 			CRLDistributionPoints: []string{"http://crl1.example.com/ca1.crl", "http://crl2.example.com/ca1.crl"},
 
@@ -440,6 +462,10 @@ func TestCreateSelfSignedCertificate(t *testing.T) {
 
 		if len(cert.PermittedDNSDomains) != 2 || cert.PermittedDNSDomains[0] != ".example.com" || cert.PermittedDNSDomains[1] != "example.com" {
 			t.Errorf("%s: failed to parse name constraints: %#v", test.name, cert.PermittedDNSDomains)
+		}
+
+		if len(cert.ExcludedDNSDomains) != 1 || cert.ExcludedDNSDomains[0] != "bar.example.com" {
+			t.Errorf("%s: failed to parse name constraint exclusions: %#v", test.name, cert.ExcludedDNSDomains)
 		}
 
 		if cert.Subject.CommonName != commonName {
@@ -514,74 +540,6 @@ func TestCreateSelfSignedCertificate(t *testing.T) {
 			if err != nil {
 				t.Errorf("%s: signature verification failed: %s", test.name, err)
 			}
-		}
-	}
-}
-
-func TestUnknownCriticalExtension(t *testing.T) {
-	priv, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
-	if err != nil {
-		t.Fatalf("Failed to generate ECDSA key: %s", err)
-	}
-
-	oids := []asn1.ObjectIdentifier{
-		// This OID is in the PKIX arc, but unknown.
-		{2, 5, 29, 999999},
-		// This is a nonsense, unassigned OID.
-		{1, 2, 3, 4},
-	}
-
-	for _, oid := range oids {
-		template := Certificate{
-			SerialNumber: big.NewInt(1),
-			Subject: pkix.Name{
-				CommonName: "foo",
-			},
-			NotBefore: time.Unix(1000, 0),
-			NotAfter:  time.Now().AddDate(1, 0, 0),
-
-			BasicConstraintsValid: true,
-			IsCA: true,
-
-			KeyUsage:    KeyUsageCertSign,
-			ExtKeyUsage: []ExtKeyUsage{ExtKeyUsageServerAuth},
-
-			ExtraExtensions: []pkix.Extension{
-				{
-					Id:       oid,
-					Critical: true,
-					Value:    nil,
-				},
-			},
-		}
-
-		derBytes, err := CreateCertificate(rand.Reader, &template, &template, &priv.PublicKey, priv)
-		if err != nil {
-			t.Fatalf("failed to create certificate: %s", err)
-		}
-
-		cert, err := ParseCertificate(derBytes)
-		if err != nil {
-			t.Fatalf("Certificate with unknown critical extension was not parsed: %s", err)
-		}
-
-		roots := NewCertPool()
-		roots.AddCert(cert)
-
-		// Setting Roots ensures that Verify won't delegate to the OS
-		// library and thus the correct error should always be
-		// returned.
-		_, err = cert.Verify(VerifyOptions{Roots: roots})
-		if err == nil {
-			t.Fatal("Certificate with unknown critical extension was verified without error")
-		}
-		if _, ok := err.(UnhandledCriticalExtension); !ok {
-			t.Fatalf("Error was %#v, but wanted one of type UnhandledCriticalExtension", err)
-		}
-
-		cert.UnhandledCriticalExtensions = nil
-		if _, err = cert.Verify(VerifyOptions{Roots: roots}); err != nil {
-			t.Errorf("Certificate failed to verify after unhandled critical extensions were cleared: %s", err)
 		}
 	}
 }
@@ -1484,5 +1442,128 @@ func TestSystemCertPool(t *testing.T) {
 	_, err := SystemCertPool()
 	if err != nil {
 		t.Fatal(err)
+	}
+}
+
+const emptyNameConstraintsPEM = `
+-----BEGIN CERTIFICATE-----
+MIIC1jCCAb6gAwIBAgICEjQwDQYJKoZIhvcNAQELBQAwKDEmMCQGA1UEAxMdRW1w
+dHkgbmFtZSBjb25zdHJhaW50cyBpc3N1ZXIwHhcNMTMwMjAxMDAwMDAwWhcNMjAw
+NTMwMTA0ODM4WjAhMR8wHQYDVQQDExZFbXB0eSBuYW1lIGNvbnN0cmFpbnRzMIIB
+IjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAwriElUIt3LCqmJObs+yDoWPD
+F5IqgWk6moIobYjPfextZiYU6I3EfvAwoNxPDkN2WowcocUZMJbEeEq5ebBksFnx
+f12gBxlIViIYwZAzu7aFvhDMyPKQI3C8CG0ZSC9ABZ1E3umdA3CEueNOmP/TChNq
+Cl23+BG1Qb/PJkpAO+GfpWSVhTcV53Mf/cKvFHcjGNrxzdSoq9fyW7a6gfcGEQY0
+LVkmwFWUfJ0wT8kaeLr0E0tozkIfo01KNWNzv6NcYP80QOBRDlApWu9ODmEVJHPD
+blx4jzTQ3JLa+4DvBNOjVUOp+mgRmjiW0rLdrxwOxIqIOwNjweMCp/hgxX/hTQID
+AQABoxEwDzANBgNVHR4EBjAEoAChADANBgkqhkiG9w0BAQsFAAOCAQEAWG+/zUMH
+QhP8uNCtgSHyim/vh7wminwAvWgMKxlkLBFns6nZeQqsOV1lABY7U0Zuoqa1Z5nb
+6L+iJa4ElREJOi/erLc9uLwBdDCAR0hUTKD7a6i4ooS39DTle87cUnj0MW1CUa6H
+v5SsvpYW+1XleYJk/axQOOTcy4Es53dvnZsjXH0EA/QHnn7UV+JmlE3rtVxcYp6M
+LYPmRhTioROA/drghicRkiu9hxdPyxkYS16M5g3Zj30jdm+k/6C6PeNtN9YmOOga
+nCOSyFYfGhqOANYzpmuV+oIedAsPpIbfIzN8njYUs1zio+1IoI4o8ddM9sCbtPU8
+o+WoY6IsCKXV/g==
+-----END CERTIFICATE-----`
+
+func TestEmptyNameConstraints(t *testing.T) {
+	block, _ := pem.Decode([]byte(emptyNameConstraintsPEM))
+	_, err := ParseCertificate(block.Bytes)
+	if err == nil {
+		t.Fatal("unexpected success")
+	}
+
+	const expected = "empty name constraints"
+	if str := err.Error(); !strings.Contains(str, expected) {
+		t.Errorf("expected %q in error but got %q", expected, str)
+	}
+}
+
+func TestPKIXNameString(t *testing.T) {
+	pem, err := hex.DecodeString(certBytes)
+	if err != nil {
+		t.Fatal(err)
+	}
+	certs, err := ParseCertificates(pem)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	tests := []struct {
+		dn   pkix.Name
+		want string
+	}{
+		{pkix.Name{
+			CommonName:         "Steve Kille",
+			Organization:       []string{"Isode Limited"},
+			OrganizationalUnit: []string{"RFCs"},
+			Locality:           []string{"Richmond"},
+			Province:           []string{"Surrey"},
+			StreetAddress:      []string{"The Square"},
+			PostalCode:         []string{"TW9 1DT"},
+			SerialNumber:       "RFC 2253",
+			Country:            []string{"GB"},
+		}, "SERIALNUMBER=RFC 2253,CN=Steve Kille,OU=RFCs,O=Isode Limited,POSTALCODE=TW9 1DT,STREET=The Square,L=Richmond,ST=Surrey,C=GB"},
+		{certs[0].Subject,
+			"CN=mail.google.com,O=Google Inc,L=Mountain View,ST=California,C=US"},
+		{pkix.Name{
+			Organization: []string{"#Google, Inc. \n-> 'Alphabet\" "},
+			Country:      []string{"US"},
+		}, "O=\\#Google\\, Inc. \n-\\> 'Alphabet\\\"\\ ,C=US"},
+		{pkix.Name{
+			CommonName:   "foo.com",
+			Organization: []string{"Gopher Industries"},
+			ExtraNames: []pkix.AttributeTypeAndValue{
+				{Type: asn1.ObjectIdentifier([]int{2, 5, 4, 3}), Value: "bar.com"}},
+		}, "CN=bar.com,O=Gopher Industries"},
+		{pkix.Name{
+			Locality: []string{"Gophertown"},
+			ExtraNames: []pkix.AttributeTypeAndValue{
+				{Type: asn1.ObjectIdentifier([]int{1, 2, 3, 4, 5}), Value: "golang.org"}},
+		}, "1.2.3.4.5=#130a676f6c616e672e6f7267,L=Gophertown"},
+	}
+
+	for i, test := range tests {
+		if got := test.dn.String(); got != test.want {
+			t.Errorf("#%d: String() = \n%s\n, want \n%s", i, got, test.want)
+		}
+	}
+}
+
+func TestRDNSequenceString(t *testing.T) {
+	// Test some extra cases that get lost in pkix.Name conversions such as
+	// multi-valued attributes.
+
+	var (
+		oidCountry            = []int{2, 5, 4, 6}
+		oidOrganization       = []int{2, 5, 4, 10}
+		oidOrganizationalUnit = []int{2, 5, 4, 11}
+		oidCommonName         = []int{2, 5, 4, 3}
+	)
+
+	tests := []struct {
+		seq  pkix.RDNSequence
+		want string
+	}{
+		{
+			seq: pkix.RDNSequence{
+				pkix.RelativeDistinguishedNameSET{
+					pkix.AttributeTypeAndValue{Type: oidCountry, Value: "US"},
+				},
+				pkix.RelativeDistinguishedNameSET{
+					pkix.AttributeTypeAndValue{Type: oidOrganization, Value: "Widget Inc."},
+				},
+				pkix.RelativeDistinguishedNameSET{
+					pkix.AttributeTypeAndValue{Type: oidOrganizationalUnit, Value: "Sales"},
+					pkix.AttributeTypeAndValue{Type: oidCommonName, Value: "J. Smith"},
+				},
+			},
+			want: "OU=Sales+CN=J. Smith,O=Widget Inc.,C=US",
+		},
+	}
+
+	for i, test := range tests {
+		if got := test.seq.String(); got != test.want {
+			t.Errorf("#%d: String() = \n%s\n, want \n%s", i, got, test.want)
+		}
 	}
 }

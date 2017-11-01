@@ -44,8 +44,9 @@ import (
 //
 // To unmarshal JSON into a struct, Unmarshal matches incoming object
 // keys to the keys used by Marshal (either the struct field name or its tag),
-// preferring an exact match but also accepting a case-insensitive match.
-// Unmarshal will only set exported fields of the struct.
+// preferring an exact match but also accepting a case-insensitive match. By
+// default, object keys which don't have a corresponding struct field are
+// ignored (see Decoder.DisallowUnknownFields for an alternative).
 //
 // To unmarshal JSON into an interface value,
 // Unmarshal stores one of these in the interface value:
@@ -79,7 +80,9 @@ import (
 // or if a JSON number overflows the target type, Unmarshal
 // skips that field and completes the unmarshaling as best it can.
 // If no more serious errors are encountered, Unmarshal returns
-// an UnmarshalTypeError describing the earliest such error.
+// an UnmarshalTypeError describing the earliest such error. In any
+// case, it's not guaranteed that all the remaining fields following
+// the problematic one will be unmarshaled into the target object.
 //
 // The JSON null value unmarshals into an interface, map, pointer, or slice
 // by setting that Go value to nil. Because null is often used in JSON to mean
@@ -136,7 +139,8 @@ func (e *UnmarshalTypeError) Error() string {
 
 // An UnmarshalFieldError describes a JSON object key that
 // led to an unexported (and therefore unwritable) struct field.
-// (No longer used; kept for compatibility.)
+//
+// Deprecated: No longer used; kept for compatibility.
 type UnmarshalFieldError struct {
 	Key   string
 	Type  reflect.Type
@@ -272,8 +276,9 @@ type decodeState struct {
 		Struct string
 		Field  string
 	}
-	savedError error
-	useNumber  bool
+	savedError            error
+	useNumber             bool
+	disallowUnknownFields bool
 }
 
 // errPhase is used for errors that should not happen unless
@@ -359,40 +364,47 @@ func (d *decodeState) scanWhile(op int) int {
 	return newOp
 }
 
-// discardObject and discardArray are dummy data targets
-// used by the (*decodeState).value method, which
-// accepts a zero reflect.Value to discard a value.
-// The (*decodeState).object and (*decodeState).array methods,
-// however, require a valid reflect.Value destination.
-// These are the target values used when the caller of value
-// wants to skip a field.
-//
-// Because these values refer to zero-sized objects
-// and thus can't be mutated, they're safe for concurrent use
-// by different goroutines unmarshalling skipped fields.
-var (
-	discardObject = reflect.ValueOf(struct{}{})
-	discardArray  = reflect.ValueOf([0]interface{}{})
-)
-
 // value decodes a JSON value from d.data[d.off:] into the value.
-// It updates d.off to point past the decoded value. If v is
-// invalid, the JSON value is discarded.
+// it updates d.off to point past the decoded value.
 func (d *decodeState) value(v reflect.Value) {
+	if !v.IsValid() {
+		_, rest, err := nextValue(d.data[d.off:], &d.nextscan)
+		if err != nil {
+			d.error(err)
+		}
+		d.off = len(d.data) - len(rest)
+
+		// d.scan thinks we're still at the beginning of the item.
+		// Feed in an empty string - the shortest, simplest value -
+		// so that it knows we got to the end of the value.
+		if d.scan.redo {
+			// rewind.
+			d.scan.redo = false
+			d.scan.step = stateBeginValue
+		}
+		d.scan.step(&d.scan, '"')
+		d.scan.step(&d.scan, '"')
+
+		n := len(d.scan.parseState)
+		if n > 0 && d.scan.parseState[n-1] == parseObjectKey {
+			// d.scan thinks we just read an object key; finish the object
+			d.scan.step(&d.scan, ':')
+			d.scan.step(&d.scan, '"')
+			d.scan.step(&d.scan, '"')
+			d.scan.step(&d.scan, '}')
+		}
+
+		return
+	}
+
 	switch op := d.scanWhile(scanSkipSpace); op {
 	default:
 		d.error(errPhase)
 
 	case scanBeginArray:
-		if !v.IsValid() {
-			v = discardArray
-		}
 		d.array(v)
 
 	case scanBeginObject:
-		if !v.IsValid() {
-			v = discardObject
-		}
 		d.object(v)
 
 	case scanBeginLiteral:
@@ -499,7 +511,7 @@ func (d *decodeState) array(v reflect.Value) {
 	switch v.Kind() {
 	case reflect.Interface:
 		if v.NumMethod() == 0 {
-			// Decoding into nil interface?  Switch to non-reflect code.
+			// Decoding into nil interface? Switch to non-reflect code.
 			v.Set(reflect.ValueOf(d.arrayInterface()))
 			return
 		}
@@ -510,7 +522,8 @@ func (d *decodeState) array(v reflect.Value) {
 		d.off--
 		d.next()
 		return
-	case reflect.Array, reflect.Slice:
+	case reflect.Array:
+	case reflect.Slice:
 		break
 	}
 
@@ -602,7 +615,7 @@ func (d *decodeState) object(v reflect.Value) {
 	}
 	v = pv
 
-	// Decoding into nil interface?  Switch to non-reflect code.
+	// Decoding into nil interface? Switch to non-reflect code.
 	if v.Kind() == reflect.Interface && v.NumMethod() == 0 {
 		v.Set(reflect.ValueOf(d.objectInterface()))
 		return
@@ -702,6 +715,8 @@ func (d *decodeState) object(v reflect.Value) {
 				}
 				d.errorContext.Field = f.name
 				d.errorContext.Struct = v.Type().Name()
+			} else if d.disallowUnknownFields {
+				d.saveError(fmt.Errorf("json: unknown field %q", key))
 			}
 		}
 
@@ -789,9 +804,7 @@ func (d *decodeState) literal(v reflect.Value) {
 	d.off--
 	d.scan.undo(op)
 
-	if v.IsValid() {
-		d.literalStore(d.data[start:d.off], v, false)
-	}
+	d.literalStore(d.data[start:d.off], v, false)
 }
 
 // convertNumber converts the number literal s to a float64 or a Number
@@ -1182,7 +1195,7 @@ func unquoteBytes(s []byte) (t []byte, ok bool) {
 	b := make([]byte, len(s)+2*utf8.UTFMax)
 	w := copy(b, s[0:r])
 	for r < len(s) {
-		// Out of room?  Can only happen if s is full of
+		// Out of room? Can only happen if s is full of
 		// malformed UTF-8 and we're replacing each
 		// byte with RuneError.
 		if w >= len(b)-2*utf8.UTFMax {
