@@ -15,6 +15,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
 	"syscall"
 	"testing"
@@ -535,6 +536,17 @@ func TestWERDialogue(t *testing.T) {
 	cmd.Env = []string{"TESTING_WER_DIALOGUE=1"}
 	// Child process should not open WER dialogue, but return immediately instead.
 	cmd.CombinedOutput()
+}
+
+func TestWindowsStackMemory(t *testing.T) {
+	o := runTestProg(t, "testprog", "StackMemory")
+	stackUsage, err := strconv.Atoi(o)
+	if err != nil {
+		t.Fatalf("Failed to read stack usage: %v", err)
+	}
+	if expected, got := 100<<10, stackUsage; got > expected {
+		t.Fatalf("expected < %d bytes of memory per thread, got %d", expected, got)
+	}
 }
 
 var used byte

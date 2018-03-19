@@ -12,6 +12,12 @@ import (
 )
 
 func TestHash(t *testing.T) {
+	oldSalt := hashSalt
+	hashSalt = nil
+	defer func() {
+		hashSalt = oldSalt
+	}()
+
 	h := NewHash("alice")
 	h.Write([]byte("hello world"))
 	sum := fmt.Sprintf("%x", h.Sum())
@@ -34,7 +40,7 @@ func TestHashFile(t *testing.T) {
 	}
 
 	var h ActionID // make sure hash result is assignable to ActionID
-	h, err = HashFile(name)
+	h, err = FileHash(name)
 	if err != nil {
 		t.Fatal(err)
 	}

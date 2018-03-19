@@ -117,10 +117,6 @@ func isSigned(t *types.Type) bool {
 	return t.IsSigned()
 }
 
-func typeSize(t *types.Type) int64 {
-	return t.Size()
-}
-
 // mergeSym merges two symbolic offsets. There is no real merging of
 // offsets, we just pick the non-nil one.
 func mergeSym(x, y interface{}) interface{} {
@@ -650,8 +646,12 @@ func zeroUpper32Bits(x *Value, depth int) bool {
 		OpAMD64ANDL, OpAMD64ANDLconst, OpAMD64ORL, OpAMD64ORLconst,
 		OpAMD64XORL, OpAMD64XORLconst, OpAMD64NEGL, OpAMD64NOTL:
 		return true
-	case OpArg, OpSelect0, OpSelect1:
+	case OpArg:
 		return x.Type.Width == 4
+	case OpSelect0, OpSelect1:
+		// Disabled for now. See issue 23305.
+		// TODO: we could look into the arg of the Select to decide.
+		return false
 	case OpPhi:
 		// Phis can use each-other as an arguments, instead of tracking visited values,
 		// just limit recursion depth.
@@ -665,6 +665,21 @@ func zeroUpper32Bits(x *Value, depth int) bool {
 		}
 		return true
 
+	}
+	return false
+}
+
+// inlineablememmovesize reports whether the given arch performs OpMove of the given size
+// faster than memmove and in a safe way when src and dst overlap.
+// This is used as a check for replacing memmove with OpMove.
+func isInlinableMemmoveSize(sz int64, c *Config) bool {
+	switch c.arch {
+	case "amd64", "amd64p32":
+		return sz <= 16
+	case "386", "ppc64", "s390x", "ppc64le":
+		return sz <= 8
+	case "arm", "mips", "mips64", "mipsle", "mips64le":
+		return sz <= 4
 	}
 	return false
 }

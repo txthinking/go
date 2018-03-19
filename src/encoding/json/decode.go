@@ -707,6 +707,19 @@ func (d *decodeState) object(v reflect.Value) {
 				for _, i := range f.index {
 					if subv.Kind() == reflect.Ptr {
 						if subv.IsNil() {
+							// If a struct embeds a pointer to an unexported type,
+							// it is not possible to set a newly allocated value
+							// since the field is unexported.
+							//
+							// See https://golang.org/issue/21357
+							if !subv.CanSet() {
+								d.saveError(fmt.Errorf("json: cannot set embedded pointer to unexported struct: %v", subv.Type().Elem()))
+								// Invalidate subv to ensure d.value(subv) skips over
+								// the JSON value without assigning it to subv.
+								subv = reflect.Value{}
+								destring = false
+								break
+							}
 							subv.Set(reflect.New(subv.Type().Elem()))
 						}
 						subv = subv.Elem()
@@ -1148,11 +1161,21 @@ func getu4(s []byte) rune {
 	if len(s) < 6 || s[0] != '\\' || s[1] != 'u' {
 		return -1
 	}
-	r, err := strconv.ParseUint(string(s[2:6]), 16, 64)
-	if err != nil {
-		return -1
+	var r rune
+	for _, c := range s[2:6] {
+		switch {
+		case '0' <= c && c <= '9':
+			c = c - '0'
+		case 'a' <= c && c <= 'f':
+			c = c - 'a' + 10
+		case 'A' <= c && c <= 'F':
+			c = c - 'A' + 10
+		default:
+			return -1
+		}
+		r = r*16 + rune(c)
 	}
-	return rune(r)
+	return r
 }
 
 // unquote converts a quoted JSON string literal s into an actual string t.

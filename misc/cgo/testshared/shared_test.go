@@ -351,10 +351,10 @@ func readNotes(f *elf.File) ([]*note, error) {
 
 func dynStrings(t *testing.T, path string, flag elf.DynTag) []string {
 	f, err := elf.Open(path)
-	defer f.Close()
 	if err != nil {
 		t.Fatalf("elf.Open(%q) failed: %v", path, err)
 	}
+	defer f.Close()
 	dynstrings, err := f.DynString(flag)
 	if err != nil {
 		t.Fatalf("DynString(%s) failed on %s: %v", flag, path, err)
@@ -504,7 +504,7 @@ func testABIHashNote(t *testing.T, f *elf.File, note *note) {
 		t.Errorf("%s has incorrect binding %v, want STB_LOCAL", hashbytes.Name, elf.ST_BIND(hashbytes.Info))
 	}
 	if f.Sections[hashbytes.Section] != note.section {
-		t.Errorf("%s has incorrect section %v, want %s", hashbytes.Name, f.Sections[hashbytes.Section].Name, note.section)
+		t.Errorf("%s has incorrect section %v, want %s", hashbytes.Name, f.Sections[hashbytes.Section].Name, note.section.Name)
 	}
 	if hashbytes.Value-note.section.Addr != 16 {
 		t.Errorf("%s has incorrect offset into section %d, want 16", hashbytes.Name, hashbytes.Value-note.section.Addr)
@@ -598,7 +598,6 @@ func TestThreeGopathShlibs(t *testing.T) {
 // If gccgo is not available or not new enough call t.Skip. Otherwise,
 // return a build.Context that is set up for gccgo.
 func prepGccgo(t *testing.T) build.Context {
-	t.Skip("golang.org/issue/22472")
 	gccgoName := os.Getenv("GCCGO")
 	if gccgoName == "" {
 		gccgoName = "gccgo"
@@ -648,8 +647,6 @@ func TestGoPathShlibGccgo(t *testing.T) {
 // library with gccgo, another GOPATH package that depends on the first and an
 // executable that links the second library.
 func TestTwoGopathShlibsGccgo(t *testing.T) {
-	t.Skip("golang.org/issue/22224")
-
 	gccgoContext := prepGccgo(t)
 
 	libgoRE := regexp.MustCompile("libgo.so.[0-9]+")

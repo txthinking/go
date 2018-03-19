@@ -206,10 +206,6 @@ var goopnames = []string{
 	OXOR:      "^",
 }
 
-func (o Op) String() string {
-	return fmt.Sprint(o)
-}
-
 func (o Op) GoString() string {
 	return fmt.Sprintf("%#v", o)
 }
@@ -232,22 +228,8 @@ func (o Op) oconv(s fmt.State, flag FmtFlag, mode fmtMode) {
 		}
 	}
 
-	if int(o) < len(opnames) && opnames[o] != "" {
-		fmt.Fprint(s, opnames[o])
-		return
-	}
-
-	fmt.Fprintf(s, "O-%d", int(o))
-}
-
-var classnames = []string{
-	"Pxxx",
-	"PEXTERN",
-	"PAUTO",
-	"PAUTOHEAP",
-	"PPARAM",
-	"PPARAMOUT",
-	"PFUNC",
+	// 'o.String()' instead of just 'o' to avoid infinite recursion
+	fmt.Fprint(s, o.String())
 }
 
 type (
@@ -447,11 +429,7 @@ func (n *Node) jconv(s fmt.State, flag FmtFlag) {
 	}
 
 	if n.Class() != 0 {
-		if int(n.Class()) < len(classnames) {
-			fmt.Fprintf(s, " class(%s)", classnames[n.Class()])
-		} else {
-			fmt.Fprintf(s, " class(%d?)", n.Class())
-		}
+		fmt.Fprintf(s, " class(%v)", n.Class())
 	}
 
 	if n.Colas() {

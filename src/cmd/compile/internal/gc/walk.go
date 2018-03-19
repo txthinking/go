@@ -988,6 +988,10 @@ opswitch:
 		n = walkexpr(n, init)
 
 	case OCONV, OCONVNOP:
+		if thearch.SoftFloat {
+			// For the soft-float case, ssa.go handles these conversions.
+			goto oconv_walkexpr
+		}
 		switch thearch.LinkArch.Family {
 		case sys.ARM, sys.MIPS:
 			if n.Left.Type.IsFloat() {
@@ -1041,6 +1045,7 @@ opswitch:
 			}
 		}
 
+	oconv_walkexpr:
 		n.Left = walkexpr(n.Left, init)
 
 	case OANDNOT:
@@ -1467,28 +1472,63 @@ opswitch:
 				na = typecheck(na, Etop)
 				init.Append(na)
 			}
+		}
+
+		if Isconst(hint, CTINT) && hint.Val().U.(*Mpint).CmpInt64(BUCKETSIZE) <= 0 {
+			// Handling make(map[any]any) and
+			// make(map[any]any, hint) where hint <= BUCKETSIZE
+			// special allows for faster map initialization and
+			// improves binary size by using calls with fewer arguments.
+			// For hint <= BUCKETSIZE overLoadFactor(hint, 0) is false
+			// and no buckets will be allocated by makemap. Therefore,
+			// no buckets need to be allocated in this code path.
+			if n.Esc == EscNone {
+				// Only need to initialize h.hash0 since
+				// hmap h has been allocated on the stack already.
+				// h.hash0 = fastrand()
+				rand := mkcall("fastrand", types.Types[TUINT32], init)
+				hashsym := hmapType.Field(4).Sym // hmap.hash0 see reflect.go:hmap
+				a := nod(OAS, nodSym(ODOT, h, hashsym), rand)
+				a = typecheck(a, Etop)
+				a = walkexpr(a, init)
+				init.Append(a)
+				n = nod(OCONVNOP, h, nil)
+				n.Type = t
+				n = typecheck(n, Erv)
+			} else {
+				// Call runtime.makehmap to allocate an
+				// hmap on the heap and initialize hmap's hash0 field.
+				fn := syslook("makemap_small")
+				fn = substArgTypes(fn, t.Key(), t.Val())
+				n = mkcall1(fn, n.Type, init)
+			}
 		} else {
-			// h = nil
-			h = nodnil()
+			if n.Esc != EscNone {
+				h = nodnil()
+			}
+			// Map initialization with a variable or large hint is
+			// more complicated. We therefore generate a call to
+			// runtime.makemap to intialize hmap and allocate the
+			// map buckets.
+
+			// When hint fits into int, use makemap instead of
+			// makemap64, which is faster and shorter on 32 bit platforms.
+			fnname := "makemap64"
+			argtype := types.Types[TINT64]
+
+			// Type checking guarantees that TIDEAL hint is positive and fits in an int.
+			// See checkmake call in TMAP case of OMAKE case in OpSwitch in typecheck1 function.
+			// The case of hint overflow when converting TUINT or TUINTPTR to TINT
+			// will be handled by the negative range checks in makemap during runtime.
+			if hint.Type.IsKind(TIDEAL) || maxintval[hint.Type.Etype].Cmp(maxintval[TUINT]) <= 0 {
+				fnname = "makemap"
+				argtype = types.Types[TINT]
+			}
+
+			fn := syslook(fnname)
+			fn = substArgTypes(fn, hmapType, t.Key(), t.Val())
+			n = mkcall1(fn, n.Type, init, typename(n.Type), conv(hint, argtype), h)
 		}
-
-		// When hint fits into int, use makemap instead of
-		// makemap64, which is faster and shorter on 32 bit platforms.
-		fnname := "makemap64"
-		argtype := types.Types[TINT64]
-
-		// Type checking guarantees that TIDEAL hint is positive and fits in an int.
-		// See checkmake call in TMAP case of OMAKE case in OpSwitch in typecheck1 function.
-		// The case of hint overflow when converting TUINT or TUINTPTR to TINT
-		// will be handled by the negative range checks in makemap during runtime.
-		if hint.Type.IsKind(TIDEAL) || maxintval[hint.Type.Etype].Cmp(maxintval[TUINT]) <= 0 {
-			fnname = "makemap"
-			argtype = types.Types[TINT]
-		}
-
-		fn := syslook(fnname)
-		fn = substArgTypes(fn, hmapType, t.Key(), t.Val())
-		n = mkcall1(fn, n.Type, init, typename(n.Type), conv(hint, argtype), h)
 
 	case OMAKESLICE:
 		l := n.Left
@@ -1709,7 +1749,7 @@ opswitch:
 		// Emit string symbol now to avoid emitting
 		// any concurrently during the backend.
 		if s, ok := n.Val().U.(string); ok {
-			_ = stringsym(s)
+			_ = stringsym(n.Pos, s)
 		}
 	}
 
@@ -2192,32 +2232,6 @@ func iscallret(n *Node) bool {
 	return n.Op == OINDREGSP
 }
 
-func isstack(n *Node) bool {
-	n = outervalue(n)
-
-	// If n is *autotmp and autotmp = &foo, replace n with foo.
-	// We introduce such temps when initializing struct literals.
-	if n.Op == OIND && n.Left.Op == ONAME && n.Left.IsAutoTmp() {
-		defn := n.Left.Name.Defn
-		if defn != nil && defn.Op == OAS && defn.Right.Op == OADDR {
-			n = defn.Right.Left
-		}
-	}
-
-	switch n.Op {
-	case OINDREGSP:
-		return true
-
-	case ONAME:
-		switch n.Class() {
-		case PAUTO, PPARAM, PPARAMOUT:
-			return true
-		}
-	}
-
-	return false
-}
-
 // isReflectHeaderDataField reports whether l is an expression p.Data
 // where p has type reflect.SliceHeader or reflect.StringHeader.
 func isReflectHeaderDataField(l *Node) bool {
@@ -2446,9 +2460,8 @@ func aliased(n *Node, all []*Node, i int) bool {
 	// Also record whether there are any writes to main memory.
 	// Also record whether there are any writes to variables
 	// whose addresses have been taken.
-	memwrite := 0
-
-	varwrite := 0
+	memwrite := false
+	varwrite := false
 	for _, an := range all[:i] {
 		a := outervalue(an.Left)
 
@@ -2457,18 +2470,18 @@ func aliased(n *Node, all []*Node, i int) bool {
 		}
 
 		if a.Op != ONAME {
-			memwrite = 1
+			memwrite = true
 			continue
 		}
 
 		switch n.Class() {
 		default:
-			varwrite = 1
+			varwrite = true
 			continue
 
 		case PAUTO, PPARAM, PPARAMOUT:
 			if n.Addrtaken() {
-				varwrite = 1
+				varwrite = true
 				continue
 			}
 
@@ -2484,7 +2497,7 @@ func aliased(n *Node, all []*Node, i int) bool {
 	// that are being written.
 
 	// If no computed addresses are affected by the writes, no aliasing.
-	if memwrite == 0 && varwrite == 0 {
+	if !memwrite && !varwrite {
 		return false
 	}
 
@@ -2792,21 +2805,23 @@ func mapfndel(name string, t *types.Type) *Node {
 const (
 	mapslow = iota
 	mapfast32
+	mapfast32ptr
 	mapfast64
+	mapfast64ptr
 	mapfaststr
 	nmapfast
 )
 
 type mapnames [nmapfast]string
 
-func mkmapnames(base string) mapnames {
-	return mapnames{base, base + "_fast32", base + "_fast64", base + "_faststr"}
+func mkmapnames(base string, ptr string) mapnames {
+	return mapnames{base, base + "_fast32", base + "_fast32" + ptr, base + "_fast64", base + "_fast64" + ptr, base + "_faststr"}
 }
 
-var mapaccess1 = mkmapnames("mapaccess1")
-var mapaccess2 = mkmapnames("mapaccess2")
-var mapassign = mkmapnames("mapassign")
-var mapdelete = mkmapnames("mapdelete")
+var mapaccess1 = mkmapnames("mapaccess1", "")
+var mapaccess2 = mkmapnames("mapaccess2", "")
+var mapassign = mkmapnames("mapassign", "ptr")
+var mapdelete = mkmapnames("mapdelete", "")
 
 func mapfast(t *types.Type) int {
 	// Check ../../runtime/hashmap.go:maxValueSize before changing.
@@ -2815,9 +2830,22 @@ func mapfast(t *types.Type) int {
 	}
 	switch algtype(t.Key()) {
 	case AMEM32:
-		return mapfast32
+		if !t.Key().HasHeapPointer() {
+			return mapfast32
+		}
+		if Widthptr == 4 {
+			return mapfast32ptr
+		}
+		Fatalf("small pointer %v", t.Key())
 	case AMEM64:
-		return mapfast64
+		if !t.Key().HasHeapPointer() {
+			return mapfast64
+		}
+		if Widthptr == 8 {
+			return mapfast64ptr
+		}
+		// Two-word object, at least one of which is a pointer.
+		// Use the slow path.
 	case ASTRING:
 		return mapfaststr
 	}
@@ -3173,7 +3201,7 @@ func copyany(n *Node, init *Nodes, runtimecall bool) *Node {
 	return nlen
 }
 
-func eqfor(t *types.Type, needsize *int) *Node {
+func eqfor(t *types.Type) (n *Node, needsize bool) {
 	// Should only arrive here with large memory or
 	// a struct/array containing a non-memory field/element.
 	// Small memory is handled inline, and single non-memory
@@ -3182,8 +3210,7 @@ func eqfor(t *types.Type, needsize *int) *Node {
 	case AMEM:
 		n := syslook("memequal")
 		n = substArgTypes(n, t, t)
-		*needsize = 1
-		return n
+		return n, true
 	case ASPECIAL:
 		sym := typesymprefix(".eq", t)
 		n := newname(sym)
@@ -3194,11 +3221,10 @@ func eqfor(t *types.Type, needsize *int) *Node {
 		ntype.Rlist.Append(anonfield(types.Types[TBOOL]))
 		ntype = typecheck(ntype, Etype)
 		n.Type = ntype.Type
-		*needsize = 0
-		return n
+		return n, false
 	}
 	Fatalf("eqfor %v", t)
-	return nil
+	return nil, false
 }
 
 // The result of walkcompare MUST be assigned back to n, e.g.
@@ -3318,11 +3344,11 @@ func walkcompare(n *Node, init *Nodes) *Node {
 		ar = typecheck(ar, Etop)
 		init.Append(ar)
 
-		var needsize int
-		call := nod(OCALL, eqfor(t, &needsize), nil)
+		fn, needsize := eqfor(t)
+		call := nod(OCALL, fn, nil)
 		call.List.Append(pl)
 		call.List.Append(pr)
-		if needsize != 0 {
+		if needsize {
 			call.List.Append(nodintconst(t.Width))
 		}
 		res := call
@@ -3389,18 +3415,23 @@ func walkcompare(n *Node, init *Nodes) *Node {
 				i++
 				remains -= t.Elem().Width
 			} else {
+				elemType := t.Elem().ToUnsigned()
 				cmplw := nod(OINDEX, cmpl, nodintconst(int64(i)))
-				cmplw = conv(cmplw, convType)
+				cmplw = conv(cmplw, elemType) // convert to unsigned
+				cmplw = conv(cmplw, convType) // widen
 				cmprw := nod(OINDEX, cmpr, nodintconst(int64(i)))
+				cmprw = conv(cmprw, elemType)
 				cmprw = conv(cmprw, convType)
 				// For code like this:  uint32(s[0]) | uint32(s[1])<<8 | uint32(s[2])<<16 ...
 				// ssa will generate a single large load.
 				for offset := int64(1); offset < step; offset++ {
 					lb := nod(OINDEX, cmpl, nodintconst(int64(i+offset)))
+					lb = conv(lb, elemType)
 					lb = conv(lb, convType)
 					lb = nod(OLSH, lb, nodintconst(int64(8*t.Elem().Width*offset)))
 					cmplw = nod(OOR, cmplw, lb)
 					rb := nod(OINDEX, cmpr, nodintconst(int64(i+offset)))
+					rb = conv(rb, elemType)
 					rb = conv(rb, convType)
 					rb = nod(OLSH, rb, nodintconst(int64(8*t.Elem().Width*offset)))
 					cmprw = nod(OOR, cmprw, rb)

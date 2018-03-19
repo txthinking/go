@@ -20,6 +20,7 @@ import (
 	"cmd/go/internal/cfg"
 	"cmd/go/internal/load"
 	"cmd/go/internal/str"
+	"cmd/internal/objabi"
 	"crypto/sha1"
 )
 
@@ -48,7 +49,7 @@ func (gcToolchain) gc(b *Builder, a *Action, archive string, importcfg []byte, a
 	pkgpath := p.ImportPath
 	if cfg.BuildBuildmode == "plugin" {
 		pkgpath = pluginPath(a)
-	} else if p.Name == "main" {
+	} else if p.Name == "main" && !p.Internal.ForceLibrary {
 		pkgpath = "main"
 	}
 	gcargs := []string{"-p", pkgpath}
@@ -90,13 +91,11 @@ func (gcToolchain) gc(b *Builder, a *Action, archive string, importcfg []byte, a
 		gcargs = append(gcargs, "-goversion", runtimeVersion)
 	}
 
-	gcflags := buildGcflags
+	gcflags := str.StringList(forcedGcflags, p.Internal.Gcflags)
 	if compilingRuntime {
 		// Remove -N, if present.
 		// It is not possible to build the runtime with no optimizations,
 		// because the compiler cannot eliminate enough write barriers.
-		gcflags = make([]string, len(buildGcflags))
-		copy(gcflags, buildGcflags)
 		for i := 0; i < len(gcflags); i++ {
 			if gcflags[i] == "-N" {
 				copy(gcflags[i:], gcflags[i+1:])
@@ -149,11 +148,6 @@ func gcBackendConcurrency(gcflags []string) int {
 		log.Fatalf("GO19CONCURRENTCOMPILATION must be 0, 1, or unset, got %q", e)
 	}
 
-	if os.Getenv("GOEXPERIMENT") != "" {
-		// Concurrent compilation is presumed incompatible with GOEXPERIMENTs.
-		canDashC = false
-	}
-
 CheckFlags:
 	for _, flag := range gcflags {
 		// Concurrent compilation is presumed incompatible with any gcflags,
@@ -166,6 +160,11 @@ CheckFlags:
 			canDashC = false
 			break CheckFlags
 		}
+	}
+
+	// TODO: Test and delete these conditions.
+	if objabi.Fieldtrack_enabled != 0 || objabi.Preemptibleloops_enabled != 0 || objabi.Clobberdead_enabled != 0 {
+		canDashC = false
 	}
 
 	if !canDashC {
@@ -215,20 +214,26 @@ func (gcToolchain) asm(b *Builder, a *Action, sfiles []string) ([]string, error)
 	p := a.Package
 	// Add -I pkg/GOOS_GOARCH so #include "textflag.h" works in .s files.
 	inc := filepath.Join(cfg.GOROOT, "pkg", "include")
-	args := []interface{}{cfg.BuildToolexec, base.Tool("asm"), "-trimpath", trimDir(a.Objdir), "-I", a.Objdir, "-I", inc, "-D", "GOOS_" + cfg.Goos, "-D", "GOARCH_" + cfg.Goarch, buildAsmflags}
+	args := []interface{}{cfg.BuildToolexec, base.Tool("asm"), "-trimpath", trimDir(a.Objdir), "-I", a.Objdir, "-I", inc, "-D", "GOOS_" + cfg.Goos, "-D", "GOARCH_" + cfg.Goarch, forcedAsmflags, p.Internal.Asmflags}
 	if p.ImportPath == "runtime" && cfg.Goarch == "386" {
-		for _, arg := range buildAsmflags {
+		for _, arg := range forcedAsmflags {
 			if arg == "-dynlink" {
 				args = append(args, "-D=GOBUILDMODE_shared=1")
 			}
 		}
 	}
+
+	if cfg.Goarch == "mips" || cfg.Goarch == "mipsle" {
+		// Define GOMIPS_value from cfg.GOMIPS.
+		args = append(args, "-D", "GOMIPS_"+cfg.GOMIPS)
+	}
+
 	var ofiles []string
 	for _, sfile := range sfiles {
 		ofile := a.Objdir + sfile[:len(sfile)-len(".s")] + ".o"
 		ofiles = append(ofiles, ofile)
-		a := append(args, "-o", ofile, mkAbs(p.Dir, sfile))
-		if err := b.run(p.Dir, p.ImportPath, nil, a...); err != nil {
+		args1 := append(args, "-o", ofile, mkAbs(p.Dir, sfile))
+		if err := b.run(a, p.Dir, p.ImportPath, nil, args1...); err != nil {
 			return nil, err
 		}
 	}
@@ -238,12 +243,12 @@ func (gcToolchain) asm(b *Builder, a *Action, sfiles []string) ([]string, error)
 // toolVerify checks that the command line args writes the same output file
 // if run using newTool instead.
 // Unused now but kept around for future use.
-func toolVerify(b *Builder, p *load.Package, newTool string, ofile string, args []interface{}) error {
+func toolVerify(a *Action, b *Builder, p *load.Package, newTool string, ofile string, args []interface{}) error {
 	newArgs := make([]interface{}, len(args))
 	copy(newArgs, args)
 	newArgs[1] = base.Tool(newTool)
 	newArgs[3] = ofile + ".new" // x.6 becomes x.6.new
-	if err := b.run(p.Dir, p.ImportPath, nil, newArgs...); err != nil {
+	if err := b.run(a, p.Dir, p.ImportPath, nil, newArgs...); err != nil {
 		return err
 	}
 	data1, err := ioutil.ReadFile(ofile)
@@ -285,7 +290,7 @@ func (gcToolchain) pack(b *Builder, a *Action, afile string, ofiles []string) er
 		return nil
 	}
 	if err := packInternal(b, absAfile, absOfiles); err != nil {
-		b.showOutput(p.Dir, p.ImportPath, err.Error()+"\n")
+		b.showOutput(a, p.Dir, p.ImportPath, err.Error()+"\n")
 		return errPrintedOutput
 	}
 	return nil
@@ -413,11 +418,6 @@ func (gcToolchain) ld(b *Builder, root *Action, out, importcfg, mainpkg string) 
 		ldflags = append(ldflags, "-pluginpath", pluginPath(root))
 	}
 
-	// TODO(rsc): This is probably wrong - see golang.org/issue/22155.
-	if cfg.GOROOT != runtime.GOROOT() {
-		ldflags = append(ldflags, "-X=runtime/internal/sys.DefaultGoroot="+cfg.GOROOT)
-	}
-
 	// Store BuildID inside toolchain binaries as a unique identifier of the
 	// tool being run, for use by content-based staleness determination.
 	if root.Package.Goroot && strings.HasPrefix(root.Package.ImportPath, "cmd/") {
@@ -430,15 +430,16 @@ func (gcToolchain) ld(b *Builder, root *Action, out, importcfg, mainpkg string) 
 	// Else, use the CC environment variable and defaultCC as fallback.
 	var compiler []string
 	if cxx {
-		compiler = envList("CXX", cfg.DefaultCXX)
+		compiler = envList("CXX", cfg.DefaultCXX(cfg.Goos, cfg.Goarch))
 	} else {
-		compiler = envList("CC", cfg.DefaultCC)
+		compiler = envList("CC", cfg.DefaultCC(cfg.Goos, cfg.Goarch))
 	}
 	ldflags = append(ldflags, "-buildmode="+ldBuildmode)
 	if root.buildID != "" {
 		ldflags = append(ldflags, "-buildid="+root.buildID)
 	}
-	ldflags = append(ldflags, cfg.BuildLdflags...)
+	ldflags = append(ldflags, forcedLdflags...)
+	ldflags = append(ldflags, root.Package.Internal.Ldflags...)
 	ldflags = setextld(ldflags, compiler)
 
 	// On OS X when using external linking to build a shared library,
@@ -455,13 +456,14 @@ func (gcToolchain) ld(b *Builder, root *Action, out, importcfg, mainpkg string) 
 		dir, out = filepath.Split(out)
 	}
 
-	return b.run(dir, root.Package.ImportPath, nil, cfg.BuildToolexec, base.Tool("link"), "-o", out, "-importcfg", importcfg, ldflags, mainpkg)
+	return b.run(root, dir, root.Package.ImportPath, nil, cfg.BuildToolexec, base.Tool("link"), "-o", out, "-importcfg", importcfg, ldflags, mainpkg)
 }
 
-func (gcToolchain) ldShared(b *Builder, toplevelactions []*Action, out, importcfg string, allactions []*Action) error {
+func (gcToolchain) ldShared(b *Builder, root *Action, toplevelactions []*Action, out, importcfg string, allactions []*Action) error {
 	ldflags := []string{"-installsuffix", cfg.BuildContext.InstallSuffix}
 	ldflags = append(ldflags, "-buildmode=shared")
-	ldflags = append(ldflags, cfg.BuildLdflags...)
+	ldflags = append(ldflags, forcedLdflags...)
+	ldflags = append(ldflags, root.Package.Internal.Ldflags...)
 	cxx := false
 	for _, a := range allactions {
 		if a.Package != nil && (len(a.Package.CXXFiles) > 0 || len(a.Package.SwigCXXFiles) > 0) {
@@ -474,9 +476,9 @@ func (gcToolchain) ldShared(b *Builder, toplevelactions []*Action, out, importcf
 	// Else, use the CC environment variable and defaultCC as fallback.
 	var compiler []string
 	if cxx {
-		compiler = envList("CXX", cfg.DefaultCXX)
+		compiler = envList("CXX", cfg.DefaultCXX(cfg.Goos, cfg.Goarch))
 	} else {
-		compiler = envList("CC", cfg.DefaultCC)
+		compiler = envList("CC", cfg.DefaultCC(cfg.Goos, cfg.Goarch))
 	}
 	ldflags = setextld(ldflags, compiler)
 	for _, d := range toplevelactions {
@@ -485,7 +487,7 @@ func (gcToolchain) ldShared(b *Builder, toplevelactions []*Action, out, importcf
 		}
 		ldflags = append(ldflags, d.Package.ImportPath+"="+d.Target)
 	}
-	return b.run(".", out, nil, cfg.BuildToolexec, base.Tool("link"), "-o", out, "-importcfg", importcfg, ldflags)
+	return b.run(root, ".", out, nil, cfg.BuildToolexec, base.Tool("link"), "-o", out, "-importcfg", importcfg, ldflags)
 }
 
 func (gcToolchain) cc(b *Builder, a *Action, ofile, cfile string) error {

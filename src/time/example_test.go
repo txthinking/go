@@ -238,10 +238,10 @@ func ExampleTime_Format() {
 	// value.
 	do("No pad", "<2>", "<7>")
 
-	// An underscore represents a zero pad, if required.
+	// An underscore represents a space pad, if the date only has one digit.
 	do("Spaces", "<_2>", "< 7>")
 
-	// Similarly, a 0 indicates zero padding.
+	// A "0" indicates zero padding for single-digit values.
 	do("Zeros", "<02>", "<07>")
 
 	// If the value is already the right width, padding is not used.
@@ -318,7 +318,7 @@ func ExampleParse() {
 	fmt.Println(t)
 
 	// Some valid layouts are invalid time values, due to format specifiers
-	// such as _ for zero padding and Z for zone information.
+	// such as _ for space padding and Z for zone information.
 	// For example the RFC3339 layout 2006-01-02T15:04:05Z07:00
 	// contains both Z and a time zone offset in order to handle both valid options:
 	// 2006-01-02T15:04:05Z
@@ -353,6 +353,24 @@ func ExampleParseInLocation() {
 	// Output:
 	// 2012-07-09 05:02:00 +0200 CEST
 	// 2012-07-09 00:00:00 +0200 CEST
+}
+
+func ExampleTime_Unix() {
+	// 1 billion seconds of Unix, three ways.
+	fmt.Println(time.Unix(1e9, 0).UTC())     // 1e9 seconds
+	fmt.Println(time.Unix(0, 1e18).UTC())    // 1e18 nanoseconds
+	fmt.Println(time.Unix(2e9, -1e18).UTC()) // 2e9 seconds - 1e18 nanoseconds
+
+	t := time.Date(2001, time.September, 9, 1, 46, 40, 0, time.UTC)
+	fmt.Println(t.Unix())     // seconds since 1970
+	fmt.Println(t.UnixNano()) // nanoseconds since 1970
+
+	// Output:
+	// 2001-09-09 01:46:40 +0000 UTC
+	// 2001-09-09 01:46:40 +0000 UTC
+	// 2001-09-09 01:46:40 +0000 UTC
+	// 1000000000
+	// 1000000000000000000
 }
 
 func ExampleTime_Round() {
@@ -568,4 +586,15 @@ func ExampleTime_Sub() {
 
 	// Output:
 	// difference = 12h0m0s
+}
+
+func ExampleTime_AppendFormat() {
+	t := time.Date(2017, time.November, 4, 11, 0, 0, 0, time.UTC)
+	text := []byte("Time: ")
+
+	text = t.AppendFormat(text, time.Kitchen)
+	fmt.Println(string(text))
+
+	// Output:
+	// Time: 11:00AM
 }

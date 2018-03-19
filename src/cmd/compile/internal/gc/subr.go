@@ -93,7 +93,7 @@ func hcrash() {
 }
 
 func linestr(pos src.XPos) string {
-	return Ctxt.OutermostPos(pos).Format(Debug['C'] == 0)
+	return Ctxt.OutermostPos(pos).Format(Debug['C'] == 0, Debug['L'] == 1)
 }
 
 // lasterror keeps track of the most recently issued error.
@@ -927,6 +927,14 @@ func convertop(src *types.Type, dst *types.Type, why *string) Op {
 		return OCONVNOP
 	}
 
+	// src is map and dst is a pointer to corresponding hmap.
+	// This rule is needed for the implementation detail that
+	// go gc maps are implemented as a pointer to a hmap struct.
+	if src.Etype == TMAP && dst.IsPtr() &&
+		src.MapType().Hmap == dst.Elem() {
+		return OCONVNOP
+	}
+
 	return 0
 }
 
@@ -1157,6 +1165,21 @@ func calcHasCall(n *Node) bool {
 		// These ops might panic, make sure they are done
 		// before we start marshaling args for a call. See issue 16760.
 		return true
+
+	// When using soft-float, these ops might be rewritten to function calls
+	// so we ensure they are evaluated first.
+	case OADD, OSUB, OMINUS:
+		if thearch.SoftFloat && (isFloat[n.Type.Etype] || isComplex[n.Type.Etype]) {
+			return true
+		}
+	case OLT, OEQ, ONE, OLE, OGE, OGT:
+		if thearch.SoftFloat && (isFloat[n.Left.Type.Etype] || isComplex[n.Left.Type.Etype]) {
+			return true
+		}
+	case OCONV:
+		if thearch.SoftFloat && ((isFloat[n.Type.Etype] || isComplex[n.Type.Etype]) || (isFloat[n.Left.Type.Etype] || isComplex[n.Left.Type.Etype])) {
+			return true
+		}
 	}
 
 	if n.Left != nil && n.Left.HasCall() {
@@ -1792,35 +1815,32 @@ func hashmem(t *types.Type) *Node {
 	return n
 }
 
-func ifacelookdot(s *types.Sym, t *types.Type, followptr *bool, ignorecase bool) *types.Field {
-	*followptr = false
-
+func ifacelookdot(s *types.Sym, t *types.Type, ignorecase bool) (m *types.Field, followptr bool) {
 	if t == nil {
-		return nil
+		return nil, false
 	}
 
-	var m *types.Field
 	path, ambig := dotpath(s, t, &m, ignorecase)
 	if path == nil {
 		if ambig {
 			yyerror("%v.%v is ambiguous", t, s)
 		}
-		return nil
+		return nil, false
 	}
 
 	for _, d := range path {
 		if d.field.Type.IsPtr() {
-			*followptr = true
+			followptr = true
 			break
 		}
 	}
 
 	if m.Type.Etype != TFUNC || m.Type.Recv() == nil {
 		yyerror("%v.%v is a field, not a method", t, s)
-		return nil
+		return nil, followptr
 	}
 
-	return m
+	return m, followptr
 }
 
 func implements(t, iface *types.Type, m, samename **types.Field, ptr *int) bool {
@@ -1865,11 +1885,10 @@ func implements(t, iface *types.Type, m, samename **types.Field, ptr *int) bool 
 		if im.Broke() {
 			continue
 		}
-		var followptr bool
-		tm := ifacelookdot(im.Sym, t, &followptr, false)
+		tm, followptr := ifacelookdot(im.Sym, t, false)
 		if tm == nil || tm.Nointerface() || !eqtype(tm.Type, im.Type) {
 			if tm == nil {
-				tm = ifacelookdot(im.Sym, t, &followptr, true)
+				tm, followptr = ifacelookdot(im.Sym, t, true)
 			}
 			*m = im
 			*samename = tm
@@ -1955,6 +1974,11 @@ func addinit(n *Node, init []*Node) *Node {
 	return n
 }
 
+// The linker uses the magic symbol prefixes "go." and "type."
+// Avoid potential confusion between import paths and symbols
+// by rejecting these reserved imports for now. Also, people
+// "can do weird things in GOPATH and we'd prefer they didn't
+// do _that_ weird thing" (per rsc). See also #4257.
 var reservedimports = []string{
 	"go",
 	"type",
@@ -2018,6 +2042,10 @@ func checknil(x *Node, init *Nodes) {
 // Can this type be stored directly in an interface word?
 // Yes, if the representation is a single pointer.
 func isdirectiface(t *types.Type) bool {
+	if t.Broke() {
+		return false
+	}
+
 	switch t.Etype {
 	case TPTR32,
 		TPTR64,

@@ -30,13 +30,15 @@ type Buffer struct {
 // converted to int they correspond to the rune size that was read.
 type readOp int8
 
+// Don't use iota for these, as the values need to correspond with the
+// names and comments, which is easier to see when being explicit.
 const (
 	opRead      readOp = -1 // Any other read operation.
-	opInvalid          = 0  // Non-read operation.
-	opReadRune1        = 1  // Read rune of size 1.
-	opReadRune2        = 2  // Read rune of size 2.
-	opReadRune3        = 3  // Read rune of size 3.
-	opReadRune4        = 4  // Read rune of size 4.
+	opInvalid   readOp = 0  // Non-read operation.
+	opReadRune1 readOp = 1  // Read rune of size 1.
+	opReadRune2 readOp = 2  // Read rune of size 2.
+	opReadRune3 readOp = 3  // Read rune of size 3.
+	opReadRune4 readOp = 4  // Read rune of size 4.
 )
 
 // ErrTooLarge is passed to panic if memory cannot be allocated to store data in a buffer.
@@ -54,6 +56,8 @@ func (b *Buffer) Bytes() []byte { return b.buf[b.off:] }
 
 // String returns the contents of the unread portion of the buffer
 // as a string. If the Buffer is a nil pointer, it returns "<nil>".
+//
+// To build strings more efficiently, see the strings.Builder type.
 func (b *Buffer) String() string {
 	if b == nil {
 		// Special case, useful in debugging.

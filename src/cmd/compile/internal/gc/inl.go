@@ -31,8 +31,10 @@ package gc
 
 import (
 	"cmd/compile/internal/types"
+	"cmd/internal/obj"
 	"cmd/internal/src"
 	"fmt"
+	"strings"
 )
 
 // Get the function's package. For ordinary functions it's on the ->sym, but for imported methods
@@ -280,13 +282,14 @@ func (v *hairyVisitor) visit(n *Node) bool {
 			v.budget -= fn.InlCost
 			break
 		}
-
 		if n.Left.isMethodExpression() {
 			if d := asNode(n.Left.Sym.Def); d != nil && d.Func.Inl.Len() != 0 {
 				v.budget -= d.Func.InlCost
 				break
 			}
 		}
+		// TODO(mdempsky): Budget for OCLOSURE calls if we
+		// ever allow that. See #15561 and #23093.
 		if Debug['l'] < 4 {
 			v.reason = "non-leaf function"
 			return true
@@ -311,11 +314,17 @@ func (v *hairyVisitor) visit(n *Node) bool {
 		}
 
 	// Things that are too hairy, irrespective of the budget
-	case OCALL, OCALLINTER, OPANIC, ORECOVER:
+	case OCALL, OCALLINTER, OPANIC:
 		if Debug['l'] < 4 {
 			v.reason = "non-leaf op " + n.Op.String()
 			return true
 		}
+
+	case ORECOVER:
+		// recover matches the argument frame pointer to find
+		// the right panic value, so it needs an argument frame.
+		v.reason = "call to recover"
+		return true
 
 	case OCLOSURE,
 		OCALLPART,
@@ -629,22 +638,16 @@ func inlnode(n *Node) *Node {
 	return n
 }
 
+// inlinableClosure takes an OCLOSURE node and follows linkage to the matching ONAME with
+// the inlinable body. Returns nil if the function is not inlinable.
 func inlinableClosure(n *Node) *Node {
 	c := n.Func.Closure
 	caninl(c)
 	f := c.Func.Nname
-	if f != nil && f.Func.Inl.Len() != 0 {
-		if n.Func.Cvars.Len() != 0 {
-			// FIXME: support closure with captured variables
-			// they currently result in invariant violation in the SSA phase
-			if Debug['m'] > 1 {
-				fmt.Printf("%v: cannot inline closure w/ captured vars %v\n", n.Line(), n.Left)
-			}
-			return nil
-		}
-		return f
+	if f == nil || f.Func.Inl.Len() == 0 {
+		return nil
 	}
-	return nil
+	return f
 }
 
 // reassigned takes an ONAME node, walks the function in which it is defined, and returns a boolean
@@ -661,8 +664,17 @@ func reassigned(n *Node) (bool, *Node) {
 	if n.Name.Curfn == nil {
 		return true, nil
 	}
+	f := n.Name.Curfn
+	// There just might be a good reason for this although this can be pretty surprising:
+	// local variables inside a closure have Curfn pointing to the OCLOSURE node instead
+	// of the corresponding ODCLFUNC.
+	// We need to walk the function body to check for reassignments so we follow the
+	// linkage to the ODCLFUNC node as that is where body is held.
+	if f.Op == OCLOSURE {
+		f = f.Func.Closure
+	}
 	v := reassignVisitor{name: n}
-	a := v.visitList(n.Name.Curfn.Nbody)
+	a := v.visitList(f.Nbody)
 	return a != nil, a
 }
 
@@ -680,7 +692,7 @@ func (v *reassignVisitor) visit(n *Node) *Node {
 			return n
 		}
 		return nil
-	case OAS2, OAS2FUNC:
+	case OAS2, OAS2FUNC, OAS2MAPR, OAS2DOTTYPE:
 		for _, p := range n.List.Slice() {
 			if p == v.name && n != v.name.Name.Defn {
 				return n
@@ -783,16 +795,56 @@ func mkinlcall1(n, fn *Node, isddd bool) *Node {
 
 	ninit := n.Ninit
 
+	// Make temp names to use instead of the originals.
+	inlvars := make(map[*Node]*Node)
+
+	// record formals/locals for later post-processing
+	var inlfvars []*Node
+
 	// Find declarations corresponding to inlineable body.
 	var dcl []*Node
 	if fn.Name.Defn != nil {
 		dcl = fn.Func.Inldcl.Slice() // local function
+
+		// handle captured variables when inlining closures
+		if c := fn.Name.Defn.Func.Closure; c != nil {
+			for _, v := range c.Func.Cvars.Slice() {
+				if v.Op == OXXX {
+					continue
+				}
+
+				o := v.Name.Param.Outer
+				// make sure the outer param matches the inlining location
+				// NB: if we enabled inlining of functions containing OCLOSURE or refined
+				// the reassigned check via some sort of copy propagation this would most
+				// likely need to be changed to a loop to walk up to the correct Param
+				if o == nil || (o.Name.Curfn != Curfn && o.Name.Curfn.Func.Closure != Curfn) {
+					Fatalf("%v: unresolvable capture %v %v\n", n.Line(), fn, v)
+				}
+
+				if v.Name.Byval() {
+					iv := typecheck(inlvar(v), Erv)
+					ninit.Append(nod(ODCL, iv, nil))
+					ninit.Append(typecheck(nod(OAS, iv, o), Etop))
+					inlvars[v] = iv
+				} else {
+					addr := newname(lookup("&" + v.Sym.Name))
+					addr.Type = types.NewPtr(v.Type)
+					ia := typecheck(inlvar(addr), Erv)
+					ninit.Append(nod(ODCL, ia, nil))
+					ninit.Append(typecheck(nod(OAS, ia, nod(OADDR, o, nil)), Etop))
+					inlvars[addr] = ia
+
+					// When capturing by reference, all occurrence of the captured var
+					// must be substituted with dereference of the temporary address
+					inlvars[v] = typecheck(nod(OIND, ia, nil), Erv)
+				}
+			}
+		}
 	} else {
 		dcl = fn.Func.Dcl // imported function
 	}
 
-	// Make temp names to use instead of the originals.
-	inlvars := make(map[*Node]*Node)
 	for _, ln := range dcl {
 		if ln.Op != ONAME {
 			continue
@@ -807,19 +859,42 @@ func mkinlcall1(n, fn *Node, isddd bool) *Node {
 		if ln.Class() == PPARAM || ln.Name.Param.Stackcopy != nil && ln.Name.Param.Stackcopy.Class() == PPARAM {
 			ninit.Append(nod(ODCL, inlvars[ln], nil))
 		}
+		if genDwarfInline > 0 {
+			inlf := inlvars[ln]
+			if ln.Class() == PPARAM {
+				inlf.SetInlFormal(true)
+			} else {
+				inlf.SetInlLocal(true)
+			}
+			inlf.Pos = ln.Pos
+			inlfvars = append(inlfvars, inlf)
+		}
 	}
 
 	// temporaries for return values.
 	var retvars []*Node
 	for i, t := range fn.Type.Results().Fields().Slice() {
 		var m *Node
+		var mpos src.XPos
 		if t != nil && asNode(t.Nname) != nil && !isblank(asNode(t.Nname)) {
+			mpos = asNode(t.Nname).Pos
 			m = inlvar(asNode(t.Nname))
 			m = typecheck(m, Erv)
 			inlvars[asNode(t.Nname)] = m
 		} else {
 			// anonymous return values, synthesize names for use in assignment that replaces return
 			m = retvar(t, i)
+		}
+
+		if genDwarfInline > 0 {
+			// Don't update the src.Pos on a return variable if it
+			// was manufactured by the inliner (e.g. "~R2"); such vars
+			// were not part of the original callee.
+			if !strings.HasPrefix(m.Sym.Name, "~R") {
+				m.SetInlFormal(true)
+				m.Pos = mpos
+				inlfvars = append(inlfvars, m)
+			}
 		}
 
 		ninit.Append(nod(ODCL, m, nil))
@@ -918,6 +993,13 @@ func mkinlcall1(n, fn *Node, isddd bool) *Node {
 	}
 	newIndex := Ctxt.InlTree.Add(parent, n.Pos, fn.Sym.Linksym())
 
+	if genDwarfInline > 0 {
+		if !fn.Sym.Linksym().WasInlined() {
+			Ctxt.DwFixups.SetPrecursorFunc(fn.Sym.Linksym(), fn)
+			fn.Sym.Linksym().Set(obj.AttrWasInlined, true)
+		}
+	}
+
 	subst := inlsubst{
 		retlabel:    retlabel,
 		retvars:     retvars,
@@ -932,6 +1014,12 @@ func mkinlcall1(n, fn *Node, isddd bool) *Node {
 	body = append(body, lab)
 
 	typecheckslice(body, Etop)
+
+	if genDwarfInline > 0 {
+		for _, v := range inlfvars {
+			v.Pos = subst.updatedPos(v.Pos)
+		}
+	}
 
 	//dumplist("ninit post", ninit);
 
@@ -983,7 +1071,7 @@ func inlvar(var_ *Node) *Node {
 
 // Synthesize a variable to store the inlined function's results in.
 func retvar(t *types.Field, i int) *Node {
-	n := newname(lookupN("~r", i))
+	n := newname(lookupN("~R", i))
 	n.Type = t.Type
 	n.SetClass(PAUTO)
 	n.Name.SetUsed(true)

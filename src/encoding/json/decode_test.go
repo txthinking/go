@@ -1193,7 +1193,8 @@ type All struct {
 	Foo  string `json:"bar"`
 	Foo2 string `json:"bar2,dummyopt"`
 
-	IntStr int64 `json:",string"`
+	IntStr     int64   `json:",string"`
+	UintptrStr uintptr `json:",string"`
 
 	PBool    *bool
 	PInt     *int
@@ -1247,24 +1248,25 @@ type Small struct {
 }
 
 var allValue = All{
-	Bool:    true,
-	Int:     2,
-	Int8:    3,
-	Int16:   4,
-	Int32:   5,
-	Int64:   6,
-	Uint:    7,
-	Uint8:   8,
-	Uint16:  9,
-	Uint32:  10,
-	Uint64:  11,
-	Uintptr: 12,
-	Float32: 14.1,
-	Float64: 15.1,
-	Foo:     "foo",
-	Foo2:    "foo2",
-	IntStr:  42,
-	String:  "16",
+	Bool:       true,
+	Int:        2,
+	Int8:       3,
+	Int16:      4,
+	Int32:      5,
+	Int64:      6,
+	Uint:       7,
+	Uint8:      8,
+	Uint16:     9,
+	Uint32:     10,
+	Uint64:     11,
+	Uintptr:    12,
+	Float32:    14.1,
+	Float64:    15.1,
+	Foo:        "foo",
+	Foo2:       "foo2",
+	IntStr:     42,
+	UintptrStr: 44,
+	String:     "16",
 	Map: map[string]Small{
 		"17": {Tag: "tag17"},
 		"18": {Tag: "tag18"},
@@ -1326,6 +1328,7 @@ var allValueIndent = `{
 	"bar": "foo",
 	"bar2": "foo2",
 	"IntStr": "42",
+	"UintptrStr": "44",
 	"PBool": null,
 	"PInt": null,
 	"PInt8": null,
@@ -1418,6 +1421,7 @@ var pallValueIndent = `{
 	"bar": "",
 	"bar2": "",
         "IntStr": "0",
+	"UintptrStr": "0",
 	"PBool": true,
 	"PInt": 2,
 	"PInt8": 3,
@@ -2082,5 +2086,83 @@ func TestInvalidStringOption(t *testing.T) {
 	err = Unmarshal(data, &item)
 	if err != nil {
 		t.Fatalf("Unmarshal: %v", err)
+	}
+}
+
+// Test unmarshal behavior with regards to embedded pointers to unexported structs.
+// If unallocated, this returns an error because unmarshal cannot set the field.
+// Issue 21357.
+func TestUnmarshalEmbeddedPointerUnexported(t *testing.T) {
+	type (
+		embed1 struct{ Q int }
+		embed2 struct{ Q int }
+		embed3 struct {
+			Q int64 `json:",string"`
+		}
+		S1 struct {
+			*embed1
+			R int
+		}
+		S2 struct {
+			*embed1
+			Q int
+		}
+		S3 struct {
+			embed1
+			R int
+		}
+		S4 struct {
+			*embed1
+			embed2
+		}
+		S5 struct {
+			*embed3
+			R int
+		}
+	)
+
+	tests := []struct {
+		in  string
+		ptr interface{}
+		out interface{}
+		err error
+	}{{
+		// Error since we cannot set S1.embed1, but still able to set S1.R.
+		in:  `{"R":2,"Q":1}`,
+		ptr: new(S1),
+		out: &S1{R: 2},
+		err: fmt.Errorf("json: cannot set embedded pointer to unexported struct: json.embed1"),
+	}, {
+		// The top level Q field takes precedence.
+		in:  `{"Q":1}`,
+		ptr: new(S2),
+		out: &S2{Q: 1},
+	}, {
+		// No issue with non-pointer variant.
+		in:  `{"R":2,"Q":1}`,
+		ptr: new(S3),
+		out: &S3{embed1: embed1{Q: 1}, R: 2},
+	}, {
+		// No error since both embedded structs have field R, which annihilate each other.
+		// Thus, no attempt is made at setting S4.embed1.
+		in:  `{"R":2}`,
+		ptr: new(S4),
+		out: new(S4),
+	}, {
+		// Error since we cannot set S5.embed1, but still able to set S5.R.
+		in:  `{"R":2,"Q":1}`,
+		ptr: new(S5),
+		out: &S5{R: 2},
+		err: fmt.Errorf("json: cannot set embedded pointer to unexported struct: json.embed3"),
+	}}
+
+	for i, tt := range tests {
+		err := Unmarshal([]byte(tt.in), tt.ptr)
+		if !reflect.DeepEqual(err, tt.err) {
+			t.Errorf("#%d: %v, want %v", i, err, tt.err)
+		}
+		if !reflect.DeepEqual(tt.ptr, tt.out) {
+			t.Errorf("#%d: mismatch\ngot:  %#+v\nwant: %#+v", i, tt.ptr, tt.out)
+		}
 	}
 }

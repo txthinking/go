@@ -173,12 +173,6 @@ func (v *bottomUpVisitor) visitcode(n *Node, min uint32) uint32 {
 // then the value can stay on the stack. If the value new(T) does
 // not escape, then new(T) can be rewritten into a stack allocation.
 // The same is true of slice literals.
-//
-// If optimizations are disabled (-N), this code is not used.
-// Instead, the compiler assumes that any value whose address
-// is taken without being immediately dereferenced
-// needs to be moved to the heap, and new(T) and slice
-// literals are always real allocations.
 
 func escapes(all []*Node) {
 	visitBottomUp(all, escAnalyze)
@@ -686,7 +680,18 @@ func (e *EscState) esc(n *Node, parent *Node) {
 	}
 
 	e.esc(n.Left, n)
+
+	if n.Op == ORANGE {
+		// ORANGE node's Right is evaluated before the loop
+		e.loopdepth--
+	}
+
 	e.esc(n.Right, n)
+
+	if n.Op == ORANGE {
+		e.loopdepth++
+	}
+
 	e.esclist(n.Nbody, n)
 	e.esclist(n.List, n)
 	e.esclist(n.Rlist, n)

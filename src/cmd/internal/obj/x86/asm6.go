@@ -148,8 +148,10 @@ const (
 	Ymm
 	Yxr
 	Yxm
+	Yxvm // VSIB vector array; vm32x/vm64x
 	Yyr
 	Yym
+	Yyvm // VSIB vector array; vm32y/vm64y
 	Ytls
 	Ytextsize
 	Yindir
@@ -204,11 +206,17 @@ const (
 	Zil_rr
 	Zbyte
 	Zvex_rm_v_r
+	Zvex_rm_v_ro
 	Zvex_r_v_rm
 	Zvex_v_rm_r
 	Zvex_i_rm_r
 	Zvex_i_r_v
 	Zvex_i_rm_v_r
+	Zvex
+	Zvex_rm_r_vo
+	Zvex_i_r_rm
+	Zvex_hr_rm_v_r
+
 	Zmax
 )
 
@@ -225,6 +233,9 @@ const (
 	Pef3 = 0xf5 /* xmm escape 2 with 16-bit prefix: 66 f3 0f */
 	Pq3  = 0x67 /* xmm escape 3: 66 48 0f */
 	Pq4  = 0x68 /* xmm escape 4: 66 0F 38 */
+	Pq4w = 0x69 /* Pq4 with Rex.w 66 0F 38 */
+	Pq5  = 0x6a /* xmm escape 5: F3 0F 38 */
+	Pq5w = 0x6b /* Pq5 with Rex.w F3 0F 38 */
 	Pfw  = 0xf4 /* Pf3 with Rex.w: f3 48 0f */
 	Pw   = 0x48 /* Rex.w */
 	Pw8  = 0x90 // symbolic; exact value doesn't matter
@@ -879,6 +890,167 @@ var yvex_vpbroadcast_sd = []ytab{
 	{Zvex_rm_v_r, 2, argList{Yxm, Yyr}},
 }
 
+var yvex_vpextrw = []ytab{
+	{Zvex_i_rm_r, 2, argList{Yi8, Yxr, Yrl}},
+	{Zvex_i_r_rm, 2, argList{Yi8, Yxr, Yml}},
+}
+
+var yvex_m = []ytab{
+	{Zvex_rm_v_ro, 3, argList{Ym}},
+}
+
+var yvex_xx3 = []ytab{
+	{Zvex_rm_v_r, 2, argList{Yxr, Yxr, Yxr}},
+}
+
+var yvex_yi3 = []ytab{
+	{Zvex_i_r_rm, 2, argList{Yi8, Yyr, Yxm}},
+}
+
+var yvex_mxy = []ytab{
+	{Zvex_rm_v_r, 2, argList{Ym, Yxr}},
+	{Zvex_rm_v_r, 2, argList{Ym, Yyr}},
+}
+
+var yvex_yy3 = []ytab{
+	{Zvex_rm_v_r, 2, argList{Yym, Yyr, Yyr}},
+}
+
+var yvex_xi3 = []ytab{
+	{Zvex_i_rm_r, 2, argList{Yi8, Yxm, Yxr}},
+}
+
+var yvex_vpermpd = []ytab{
+	{Zvex_i_rm_r, 2, argList{Yi8, Yym, Yyr}},
+}
+
+var yvex_vpermilp = []ytab{
+	{Zvex_i_rm_r, 2, argList{Yi8, Yxm, Yxr}},
+	{Zvex_rm_v_r, 2, argList{Yxm, Yxr, Yxr}},
+	{Zvex_i_rm_r, 2, argList{Yi8, Yym, Yyr}},
+	{Zvex_rm_v_r, 2, argList{Yym, Yyr, Yyr}},
+}
+
+var yvex_vcvtps2ph = []ytab{
+	{Zvex_i_r_rm, 2, argList{Yi8, Yyr, Yxm}},
+	{Zvex_i_r_rm, 2, argList{Yi8, Yxr, Yxm}},
+}
+
+var yvex_vbroadcastf = []ytab{
+	{Zvex_rm_v_r, 2, argList{Ym, Yyr}},
+}
+
+var yvex_vmovd = []ytab{
+	{Zvex_r_v_rm, 2, argList{Yxr, Yml}},
+	{Zvex_rm_v_r, 2, argList{Yml, Yxr}},
+}
+
+var yvex_x2 = []ytab{
+	{Zvex_rm_v_r, 2, argList{Yxm, Yxr}},
+}
+
+var yvex_y2 = []ytab{
+	{Zvex_rm_v_r, 2, argList{Yym, Yxr}},
+}
+
+var yvex = []ytab{
+	{Zvex, 2, argList{}},
+}
+
+var yvex_xx2 = []ytab{
+	{Zvex_rm_v_r, 2, argList{Yxr, Yxr}},
+}
+
+var yvex_vpalignr = []ytab{
+	{Zvex_i_rm_v_r, 2, argList{Yu8, Yxm, Yxr, Yxr}},
+	{Zvex_i_rm_v_r, 2, argList{Yu8, Yym, Yyr, Yyr}},
+}
+
+var yvex_rxi4 = []ytab{
+	{Zvex_i_rm_v_r, 2, argList{Yu8, Yml, Yxr, Yxr}},
+}
+
+var yvex_xxi4 = []ytab{
+	{Zvex_i_rm_v_r, 2, argList{Yu8, Yxm, Yxr, Yxr}},
+}
+
+var yvex_xy4 = []ytab{
+	{Zvex_hr_rm_v_r, 2, argList{Yxr, Yxm, Yxr, Yxr}},
+	{Zvex_hr_rm_v_r, 2, argList{Yyr, Yym, Yyr, Yyr}},
+}
+
+var yvex_vpbroadcast_ss = []ytab{
+	{Zvex_rm_v_r, 2, argList{Ym, Yxr}},
+	{Zvex_rm_v_r, 2, argList{Yxr, Yxr}},
+	{Zvex_rm_v_r, 2, argList{Ym, Yyr}},
+	{Zvex_rm_v_r, 2, argList{Yxr, Yyr}},
+}
+
+var yvex_vblendvpd = []ytab{
+	{Zvex_r_v_rm, 2, argList{Yxr, Yxr, Yml}},
+	{Zvex_r_v_rm, 2, argList{Yyr, Yyr, Yml}},
+	{Zvex_rm_v_r, 2, argList{Ym, Yxr, Yxr}},
+	{Zvex_rm_v_r, 2, argList{Ym, Yyr, Yyr}},
+}
+
+var yvex_vmov = []ytab{
+	{Zvex_r_v_rm, 2, argList{Yxr, Ym}},
+	{Zvex_rm_v_r, 2, argList{Ym, Yxr}},
+	{Zvex_rm_v_r, 2, argList{Yxr, Yxr, Yxr}},
+	{Zvex_rm_v_r, 2, argList{Yxr, Yxr, Yxr}},
+}
+
+var yvex_vps = []ytab{
+	{Zvex_rm_v_r, 2, argList{Yxm, Yxr, Yxr}},
+	{Zvex_i_r_v, 3, argList{Yi8, Yxr, Yxr}},
+	{Zvex_rm_v_r, 2, argList{Yxm, Yyr, Yyr}},
+	{Zvex_i_r_v, 3, argList{Yi8, Yyr, Yyr}},
+}
+
+var yvex_r2 = []ytab{
+	{Zvex_rm_r_vo, 3, argList{Yml, Yrl}},
+}
+
+var yvex_vpextr = []ytab{
+	{Zvex_i_r_rm, 2, argList{Yi8, Yxr, Yml}},
+}
+
+var yvex_rx3 = []ytab{
+	{Zvex_rm_v_r, 2, argList{Yml, Yxr, Yxr}},
+}
+
+var yvex_vcvtsd2si = []ytab{
+	{Zvex_rm_v_r, 2, argList{Yxm, Yrl}},
+}
+
+var yvex_vmovhpd = []ytab{
+	{Zvex_r_v_rm, 2, argList{Yxr, Ym}},
+	{Zvex_rm_v_r, 2, argList{Ym, Yxr, Yxr}},
+}
+
+var yvex_vmovq = []ytab{
+	{Zvex_r_v_rm, 2, argList{Yxr, Yml}},
+	{Zvex_rm_v_r, 2, argList{Ym, Yxr}},
+	{Zvex_rm_v_r, 2, argList{Yml, Yxr}},
+	{Zvex_rm_v_r, 2, argList{Yxr, Yxr}},
+	{Zvex_r_v_rm, 2, argList{Yxr, Yxm}},
+}
+
+var yvpgatherdq = []ytab{
+	{Zvex_v_rm_r, 2, argList{Yxr, Yxvm, Yxr}},
+	{Zvex_v_rm_r, 2, argList{Yyr, Yxvm, Yyr}},
+}
+
+var yvpgatherqq = []ytab{
+	{Zvex_v_rm_r, 2, argList{Yxr, Yxvm, Yxr}},
+	{Zvex_v_rm_r, 2, argList{Yyr, Yyvm, Yyr}},
+}
+
+var yvgatherqps = []ytab{
+	{Zvex_v_rm_r, 2, argList{Yxr, Yxvm, Yxr}},
+	{Zvex_v_rm_r, 2, argList{Yxr, Yyvm, Yxr}},
+}
+
 var ymmxmm0f38 = []ytab{
 	{Zlitm_r, 3, argList{Ymm, Ymr}},
 	{Zlitm_r, 5, argList{Yxm, Yxr}},
@@ -956,6 +1128,8 @@ var optab =
 	{AADCL, yaddl, Px, [23]uint8{0x83, 02, 0x15, 0x81, 02, 0x11, 0x13}},
 	{AADCQ, yaddl, Pw, [23]uint8{0x83, 02, 0x15, 0x81, 02, 0x11, 0x13}},
 	{AADCW, yaddl, Pe, [23]uint8{0x83, 02, 0x15, 0x81, 02, 0x11, 0x13}},
+	{AADCXL, yml_rl, Pq4, [23]uint8{0xf6}},
+	{AADCXQ, yml_rl, Pq4w, [23]uint8{0xf6}},
 	{AADDB, yxorb, Pb, [23]uint8{0x04, 0x80, 00, 0x00, 0x02}},
 	{AADDL, yaddl, Px, [23]uint8{0x83, 00, 0x05, 0x81, 00, 0x01, 0x03}},
 	{AADDPD, yxm, Pq, [23]uint8{0x58}},
@@ -966,6 +1140,8 @@ var optab =
 	{AADDSUBPD, yxm, Pq, [23]uint8{0xd0}},
 	{AADDSUBPS, yxm, Pf2, [23]uint8{0xd0}},
 	{AADDW, yaddl, Pe, [23]uint8{0x83, 00, 0x05, 0x81, 00, 0x01, 0x03}},
+	{AADOXL, yml_rl, Pq5, [23]uint8{0xf6}},
+	{AADOXQ, yml_rl, Pq5w, [23]uint8{0xf6}},
 	{AADJSP, nil, 0, [23]uint8{}},
 	{AANDB, yxorb, Pb, [23]uint8{0x24, 0x80, 04, 0x20, 0x22}},
 	{AANDL, yaddl, Px, [23]uint8{0x83, 04, 0x25, 0x81, 04, 0x21, 0x23}},
@@ -1696,6 +1872,44 @@ var optab =
 	{obj.APCDATA, ypcdata, Px, [23]uint8{0, 0}},
 	{obj.ADUFFCOPY, yduff, Px, [23]uint8{0xe8}},
 	{obj.ADUFFZERO, yduff, Px, [23]uint8{0xe8}},
+
+	// AVX2 gather instructions.
+	// Added as a part of VSIB support implementation,
+	// when x86avxgen will output these, they will be moved to
+	// vex_optabs.go where they belong.
+	{AVGATHERDPD, yvpgatherdq, Pvex, [23]uint8{
+		vexDDS | vex128 | vex66 | vex0F38 | vexW1, 0x92,
+		vexDDS | vex256 | vex66 | vex0F38 | vexW1, 0x92,
+	}},
+	{AVGATHERQPD, yvpgatherqq, Pvex, [23]uint8{
+		vexDDS | vex128 | vex66 | vex0F38 | vexW1, 0x93,
+		vexDDS | vex256 | vex66 | vex0F38 | vexW1, 0x93,
+	}},
+	{AVGATHERDPS, yvpgatherqq, Pvex, [23]uint8{
+		vexDDS | vex128 | vex66 | vex0F38 | vexW0, 0x92,
+		vexDDS | vex256 | vex66 | vex0F38 | vexW0, 0x92,
+	}},
+	{AVGATHERQPS, yvgatherqps, Pvex, [23]uint8{
+		vexDDS | vex128 | vex66 | vex0F38 | vexW0, 0x93,
+		vexDDS | vex256 | vex66 | vex0F38 | vexW0, 0x93,
+	}},
+	{AVPGATHERDD, yvpgatherqq, Pvex, [23]uint8{
+		vexDDS | vex128 | vex66 | vex0F38 | vexW0, 0x90,
+		vexDDS | vex256 | vex66 | vex0F38 | vexW0, 0x90,
+	}},
+	{AVPGATHERQD, yvgatherqps, Pvex, [23]uint8{
+		vexDDS | vex128 | vex66 | vex0F38 | vexW0, 0x91,
+		vexDDS | vex256 | vex66 | vex0F38 | vexW0, 0x91,
+	}},
+	{AVPGATHERDQ, yvpgatherdq, Pvex, [23]uint8{
+		vexDDS | vex128 | vex66 | vex0F38 | vexW1, 0x90,
+		vexDDS | vex256 | vex66 | vex0F38 | vexW1, 0x90,
+	}},
+	{AVPGATHERQQ, yvpgatherqq, Pvex, [23]uint8{
+		vexDDS | vex128 | vex66 | vex0F38 | vexW1, 0x91,
+		vexDDS | vex256 | vex66 | vex0F38 | vexW1, 0x91,
+	}},
+
 	{obj.AEND, nil, 0, [23]uint8{}},
 	{0, nil, 0, [23]uint8{}},
 }
@@ -2277,6 +2491,18 @@ func oclass(ctxt *obj.Link, p *obj.Prog, a *obj.Addr) int {
 			// Can't use SP as the index register
 			return Yxxx
 		}
+		if a.Index >= REG_X0 && a.Index <= REG_X15 {
+			if ctxt.Arch.Family == sys.I386 && a.Index > REG_X7 {
+				return Yxxx
+			}
+			return Yxvm
+		}
+		if a.Index >= REG_Y0 && a.Index <= REG_Y15 {
+			if ctxt.Arch.Family == sys.I386 && a.Index > REG_Y7 {
+				return Yxxx
+			}
+			return Yyvm
+		}
 		if ctxt.Arch.Family == sys.AMD64 {
 			// Offset must fit in a 32-bit signed field (or fit in a 32-bit unsigned field
 			// where the sign extension doesn't matter).
@@ -2689,9 +2915,11 @@ func (a *AsmBuf) Reset() { a.off = 0 }
 // At returns the byte at offset i.
 func (a *AsmBuf) At(i int) byte { return a.buf[i] }
 
+// asmidx emits SIB byte.
 func (asmbuf *AsmBuf) asmidx(ctxt *obj.Link, scale int, index int, base int) {
 	var i int
 
+	// X/Y index register is used in VSIB.
 	switch index {
 	default:
 		goto bad
@@ -2707,7 +2935,23 @@ func (asmbuf *AsmBuf) asmidx(ctxt *obj.Link, scale int, index int, base int) {
 		REG_R12,
 		REG_R13,
 		REG_R14,
-		REG_R15:
+		REG_R15,
+		REG_X8,
+		REG_X9,
+		REG_X10,
+		REG_X11,
+		REG_X12,
+		REG_X13,
+		REG_X14,
+		REG_X15,
+		REG_Y8,
+		REG_Y9,
+		REG_Y10,
+		REG_Y11,
+		REG_Y12,
+		REG_Y13,
+		REG_Y14,
+		REG_Y15:
 		if ctxt.Arch.Family == sys.I386 {
 			goto bad
 		}
@@ -2719,7 +2963,23 @@ func (asmbuf *AsmBuf) asmidx(ctxt *obj.Link, scale int, index int, base int) {
 		REG_BX,
 		REG_BP,
 		REG_SI,
-		REG_DI:
+		REG_DI,
+		REG_X0,
+		REG_X1,
+		REG_X2,
+		REG_X3,
+		REG_X4,
+		REG_X5,
+		REG_X6,
+		REG_X7,
+		REG_Y0,
+		REG_Y1,
+		REG_Y2,
+		REG_Y3,
+		REG_Y4,
+		REG_Y5,
+		REG_Y6,
+		REG_Y7:
 		i = reg[index] << 3
 	}
 
@@ -3330,6 +3590,35 @@ func (asmbuf *AsmBuf) asmvex(ctxt *obj.Link, rm, v, r *obj.Addr, vex, opcode uin
 	asmbuf.Put1(opcode)
 }
 
+// regIndex returns register index that fits in 4 bits.
+//
+// Examples:
+//   REG_X15 => 15
+//   REG_R9  => 9
+//   REG_AX  => 0
+//
+func regIndex(r int16) int {
+	lower3bits := reg[r]
+	high4bit := regrex[r] & Rxr << 1
+	return lower3bits | high4bit
+}
+
+// avx2gatherValid returns true if p satisfies AVX2 gather constraints.
+// Reports errors via ctxt.
+func avx2gatherValid(ctxt *obj.Link, p *obj.Prog) bool {
+	// If any pair of the index, mask, or destination registers
+	// are the same, this instruction results a #UD fault.
+	index := regIndex(p.GetFrom3().Index)
+	mask := regIndex(p.From.Reg)
+	dest := regIndex(p.To.Reg)
+	if dest == mask || dest == index || mask == index {
+		ctxt.Diag("mask, index, and destination registers should be distinct: %v", p)
+		return false
+	}
+
+	return true
+}
+
 func (asmbuf *AsmBuf) doasm(ctxt *obj.Link, cursym *obj.LSym, p *obj.Prog) {
 	o := opindex[p.As&obj.AMask]
 
@@ -3377,6 +3666,18 @@ func (asmbuf *AsmBuf) doasm(ctxt *obj.Link, cursym *obj.LSym, p *obj.Prog) {
 			p.To.Type = obj.TYPE_CONST
 			p.To.Offset = p.GetFrom3().Offset
 			p.GetFrom3().Offset = 0
+		}
+
+	case AVGATHERDPD,
+		AVGATHERQPD,
+		AVGATHERDPS,
+		AVGATHERQPS,
+		AVPGATHERDD,
+		AVPGATHERQD,
+		AVPGATHERDQ,
+		AVPGATHERQQ:
+		if !avx2gatherValid(ctxt, p) {
+			return
 		}
 	}
 
@@ -3431,6 +3732,17 @@ func (asmbuf *AsmBuf) doasm(ctxt *obj.Link, cursym *obj.LSym, p *obj.Prog) {
 
 			case Pq4: /*  66 0F 38 */
 				asmbuf.Put3(0x66, 0x0F, 0x38)
+
+			case Pq4w: /*  66 0F 38 + REX.W */
+				asmbuf.rexflag |= Pw
+				asmbuf.Put3(0x66, 0x0F, 0x38)
+
+			case Pq5: /*  F3 0F 38 */
+				asmbuf.Put3(0xF3, 0x0F, 0x38)
+
+			case Pq5w: /*  F3 0F 38 + REX.W */
+				asmbuf.rexflag |= Pw
+				asmbuf.Put3(0xF3, 0x0F, 0x38)
 
 			case Pf2, /* xmm opcode escape */
 				Pf3:
@@ -3599,9 +3911,16 @@ func (asmbuf *AsmBuf) doasm(ctxt *obj.Link, cursym *obj.LSym, p *obj.Prog) {
 				asmbuf.Put1(byte(op))
 				asmbuf.asmand(ctxt, cursym, p, &p.To, &p.From)
 
+			case Zvex:
+				asmbuf.asmvex(ctxt, &p.From, p.GetFrom3(), &p.To, o.op[z], o.op[z+1])
+
 			case Zvex_rm_v_r:
 				asmbuf.asmvex(ctxt, &p.From, p.GetFrom3(), &p.To, o.op[z], o.op[z+1])
 				asmbuf.asmand(ctxt, cursym, p, &p.From, &p.To)
+
+			case Zvex_rm_v_ro:
+				asmbuf.asmvex(ctxt, &p.From, p.GetFrom3(), &p.To, o.op[z], o.op[z+1])
+				asmbuf.asmando(ctxt, cursym, p, &p.From, int(o.op[z+2]))
 
 			case Zvex_i_r_v:
 				asmbuf.asmvex(ctxt, p.GetFrom3(), &p.To, nil, o.op[z], o.op[z+1])
@@ -3632,6 +3951,21 @@ func (asmbuf *AsmBuf) doasm(ctxt *obj.Link, cursym *obj.LSym, p *obj.Prog) {
 			case Zvex_r_v_rm:
 				asmbuf.asmvex(ctxt, &p.To, p.GetFrom3(), &p.From, o.op[z], o.op[z+1])
 				asmbuf.asmand(ctxt, cursym, p, &p.To, &p.From)
+
+			case Zvex_rm_r_vo:
+				asmbuf.asmvex(ctxt, &p.From, &p.To, p.GetFrom3(), o.op[z], o.op[z+1])
+				asmbuf.asmando(ctxt, cursym, p, &p.From, int(o.op[z+2]))
+
+			case Zvex_i_r_rm:
+				asmbuf.asmvex(ctxt, &p.To, nil, p.GetFrom3(), o.op[z], o.op[z+1])
+				asmbuf.asmand(ctxt, cursym, p, &p.To, p.GetFrom3())
+				asmbuf.Put1(byte(p.From.Offset))
+
+			case Zvex_hr_rm_v_r:
+				hr, from, from3, to := unpackOps4(p)
+				asmbuf.asmvex(ctxt, from, from3, to, o.op[z], o.op[z+1])
+				asmbuf.asmand(ctxt, cursym, p, from, to)
+				asmbuf.Put1(byte(regIndex(hr.Reg) << 4))
 
 			case Zr_m_xm:
 				asmbuf.mediaop(ctxt, o, op, int(yt.zoffset), z)

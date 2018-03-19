@@ -15,6 +15,7 @@ import (
 	"go/token"
 	"io"
 	"os"
+	"path/filepath"
 	"sort"
 	"strings"
 )
@@ -526,7 +527,7 @@ func (p *Package) writeOutput(f *File, srcfile string) {
 	if strings.HasSuffix(base, ".go") {
 		base = base[0 : len(base)-3]
 	}
-	base = strings.Map(slashToUnderscore, base)
+	base = filepath.Base(base)
 	fgo1 := creat(*objDir + base + ".cgo1.go")
 	fgcc := creat(*objDir + base + ".cgo2.c")
 
@@ -535,10 +536,12 @@ func (p *Package) writeOutput(f *File, srcfile string) {
 
 	// Write Go output: Go input with rewrites of C.xxx to _C_xxx.
 	fmt.Fprintf(fgo1, "// Created by cgo - DO NOT EDIT\n\n")
-	conf.Fprint(fgo1, fset, f.AST)
+	fmt.Fprintf(fgo1, "//line %s:1\n", srcfile)
+	fgo1.Write(f.Edit.Bytes())
 
 	// While we process the vars and funcs, also write gcc output.
 	// Gcc output starts with the preamble.
+	fmt.Fprintf(fgcc, "%s\n", builtinProlog)
 	fmt.Fprintf(fgcc, "%s\n", f.Preamble)
 	fmt.Fprintf(fgcc, "%s\n", gccProlog)
 	fmt.Fprintf(fgcc, "%s\n", tsanProlog)
@@ -692,14 +695,18 @@ func (p *Package) writeGccgoOutputFunc(fgcc *os.File, n *Name) {
 			fmt.Fprintf(fgcc, "(void*)")
 		}
 	}
-	fmt.Fprintf(fgcc, "%s(", n.C)
-	for i := range n.FuncType.Params {
-		if i > 0 {
-			fmt.Fprintf(fgcc, ", ")
+	if n.Kind == "macro" {
+		fmt.Fprintf(fgcc, "%s;\n", n.C)
+	} else {
+		fmt.Fprintf(fgcc, "%s(", n.C)
+		for i := range n.FuncType.Params {
+			if i > 0 {
+				fmt.Fprintf(fgcc, ", ")
+			}
+			fmt.Fprintf(fgcc, "p%d", i)
 		}
-		fmt.Fprintf(fgcc, "p%d", i)
+		fmt.Fprintf(fgcc, ");\n")
 	}
-	fmt.Fprintf(fgcc, ");\n")
 	fmt.Fprintf(fgcc, "\t_cgo_tsan_release();\n")
 	if t := n.FuncType.Result; t != nil {
 		fmt.Fprintf(fgcc, "\treturn ")
@@ -1145,6 +1152,7 @@ func (p *Package) writeExportHeader(fgcch io.Writer) {
 		pkg = p.PackagePath
 	}
 	fmt.Fprintf(fgcch, "/* package %s */\n\n", pkg)
+	fmt.Fprintf(fgcch, "%s\n", builtinExportProlog)
 
 	fmt.Fprintf(fgcch, "/* Start of preamble from import \"C\" comments.  */\n\n")
 	fmt.Fprintf(fgcch, "%s\n", p.Preamble)
@@ -1389,7 +1397,7 @@ const builtinProlog = `
 /* Define intgo when compiling with GCC.  */
 typedef ptrdiff_t intgo;
 
-typedef struct { char *p; intgo n; } _GoString_;
+typedef struct { const char *p; intgo n; } _GoString_;
 typedef struct { char *p; intgo n; intgo c; } _GoBytes_;
 _GoString_ GoString(char *p);
 _GoString_ GoStringN(char *p, int l);
@@ -1397,6 +1405,12 @@ _GoBytes_ GoBytes(void *p, int n);
 char *CString(_GoString_);
 void *CBytes(_GoBytes_);
 void *_CMalloc(size_t);
+
+__attribute__ ((unused))
+static size_t _GoStringLen(_GoString_ s) { return s.n; }
+
+__attribute__ ((unused))
+static const char *_GoStringPtr(_GoString_ s) { return s.p; }
 `
 
 const goProlog = `
@@ -1628,6 +1642,25 @@ void localCgoCheckResult(Eface val) {
 }
 `
 
+// builtinExportProlog is a shorter version of builtinProlog,
+// to be put into the _cgo_export.h file.
+// For historical reasons we can't use builtinProlog in _cgo_export.h,
+// because _cgo_export.h defines GoString as a struct while builtinProlog
+// defines it as a function. We don't change this to avoid unnecessarily
+// breaking existing code.
+const builtinExportProlog = `
+#line 1 "cgo-builtin-prolog"
+
+#include <stddef.h> /* for ptrdiff_t below */
+
+#ifndef GO_CGO_EXPORT_PROLOGUE_H
+#define GO_CGO_EXPORT_PROLOGUE_H
+
+typedef struct { const char *p; ptrdiff_t n; } _GoString_;
+
+#endif
+`
+
 func (p *Package) gccExportHeaderProlog() string {
 	return strings.Replace(gccExportHeaderProlog, "GOINTBITS", fmt.Sprint(8*p.IntSize), -1)
 }
@@ -1661,7 +1694,7 @@ typedef double _Complex GoComplex128;
 */
 typedef char _check_for_GOINTBITS_bit_pointer_matching_GoInt[sizeof(void*)==GOINTBITS/8 ? 1:-1];
 
-typedef struct { const char *p; GoInt n; } GoString;
+typedef _GoString_ GoString;
 typedef void *GoMap;
 typedef void *GoChan;
 typedef struct { void *t; void *v; } GoInterface;

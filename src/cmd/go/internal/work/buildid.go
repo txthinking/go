@@ -5,7 +5,9 @@
 package work
 
 import (
+	"bytes"
 	"fmt"
+	"io/ioutil"
 	"os"
 	"os/exec"
 	"strings"
@@ -93,6 +95,15 @@ import (
 
 const buildIDSeparator = "/"
 
+// actionID returns the action ID half of a build ID.
+func actionID(buildID string) string {
+	i := strings.Index(buildID, buildIDSeparator)
+	if i < 0 {
+		return buildID
+	}
+	return buildID[:i]
+}
+
 // contentID returns the content ID half of a build ID.
 func contentID(buildID string) string {
 	return buildID[strings.LastIndex(buildID, buildIDSeparator)+1:]
@@ -166,12 +177,14 @@ func (b *Builder) toolID(name string) string {
 	cmdline := str.StringList(cfg.BuildToolexec, base.Tool(name), "-V=full")
 	cmd := exec.Command(cmdline[0], cmdline[1:]...)
 	cmd.Env = base.EnvForDir(cmd.Dir, os.Environ())
-	out, err := cmd.CombinedOutput()
-	if err != nil {
-		base.Fatalf("go tool %s: %v\n%s", name, err, out)
+	var stdout, stderr bytes.Buffer
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+	if err := cmd.Run(); err != nil {
+		base.Fatalf("go tool %s: %v\n%s%s", name, err, stdout.Bytes(), stderr.Bytes())
 	}
 
-	line := string(out)
+	line := stdout.String()
 	f := strings.Fields(line)
 	if len(f) < 3 || f[0] != name || f[1] != "version" || f[2] == "devel" && !strings.HasPrefix(f[len(f)-1], "buildID=") {
 		base.Fatalf("go tool %s -V=full: unexpected output:\n\t%s", name, line)
@@ -189,6 +202,132 @@ func (b *Builder) toolID(name string) string {
 	b.id.Unlock()
 
 	return id
+}
+
+// gccToolID returns the unique ID to use for a tool that is invoked
+// by the GCC driver. This is in particular gccgo, but this can also
+// be used for gcc, g++, gfortran, etc.; those tools all use the GCC
+// driver under different names. The approach used here should also
+// work for sufficiently new versions of clang. Unlike toolID, the
+// name argument is the program to run. The language argument is the
+// type of input file as passed to the GCC driver's -x option.
+//
+// For these tools we have no -V=full option to dump the build ID,
+// but we can run the tool with -v -### to reliably get the compiler proper
+// and hash that. That will work in the presence of -toolexec.
+//
+// In order to get reproducible builds for released compilers, we
+// detect a released compiler by the absence of "experimental" in the
+// --version output, and in that case we just use the version string.
+func (b *Builder) gccgoToolID(name, language string) (string, error) {
+	key := name + "." + language
+	b.id.Lock()
+	id := b.toolIDCache[key]
+	b.id.Unlock()
+
+	if id != "" {
+		return id, nil
+	}
+
+	// Invoke the driver with -### to see the subcommands and the
+	// version strings. Use -x to set the language. Pretend to
+	// compile an empty file on standard input.
+	cmdline := str.StringList(cfg.BuildToolexec, name, "-###", "-x", language, "-c", "-")
+	cmd := exec.Command(cmdline[0], cmdline[1:]...)
+	cmd.Env = base.EnvForDir(cmd.Dir, os.Environ())
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		return "", fmt.Errorf("%s: %v; output: %q", name, err, out)
+	}
+
+	version := ""
+	lines := strings.Split(string(out), "\n")
+	for _, line := range lines {
+		if fields := strings.Fields(line); len(fields) > 1 && fields[1] == "version" {
+			version = line
+			break
+		}
+	}
+	if version == "" {
+		return "", fmt.Errorf("%s: can not find version number in %q", name, out)
+	}
+
+	if !strings.Contains(version, "experimental") {
+		// This is a release. Use this line as the tool ID.
+		id = version
+	} else {
+		// This is a development version. The first line with
+		// a leading space is the compiler proper.
+		compiler := ""
+		for _, line := range lines {
+			if len(line) > 1 && line[0] == ' ' {
+				compiler = line
+				break
+			}
+		}
+		if compiler == "" {
+			return "", fmt.Errorf("%s: can not find compilation command in %q", name, out)
+		}
+
+		fields := strings.Fields(compiler)
+		if len(fields) == 0 {
+			return "", fmt.Errorf("%s: compilation command confusion %q", name, out)
+		}
+		exe := fields[0]
+		if !strings.ContainsAny(exe, `/\`) {
+			if lp, err := exec.LookPath(exe); err == nil {
+				exe = lp
+			}
+		}
+		if _, err := os.Stat(exe); err != nil {
+			return "", fmt.Errorf("%s: can not find compiler %q: %v; output %q", name, exe, err, out)
+		}
+		id = b.fileHash(exe)
+	}
+
+	b.id.Lock()
+	b.toolIDCache[name] = id
+	b.id.Unlock()
+
+	return id, nil
+}
+
+// gccgoBuildIDELFFile creates an assembler file that records the
+// action's build ID in an SHF_EXCLUDE section.
+func (b *Builder) gccgoBuildIDELFFile(a *Action) (string, error) {
+	sfile := a.Objdir + "_buildid.s"
+
+	var buf bytes.Buffer
+	fmt.Fprintf(&buf, "\t"+`.section .go.buildid,"e"`+"\n")
+	fmt.Fprintf(&buf, "\t.byte ")
+	for i := 0; i < len(a.buildID); i++ {
+		if i > 0 {
+			if i%8 == 0 {
+				fmt.Fprintf(&buf, "\n\t.byte ")
+			} else {
+				fmt.Fprintf(&buf, ",")
+			}
+		}
+		fmt.Fprintf(&buf, "%#02x", a.buildID[i])
+	}
+	fmt.Fprintf(&buf, "\n")
+	fmt.Fprintf(&buf, "\t"+`.section .note.GNU-stack,"",@progbits`+"\n")
+	fmt.Fprintf(&buf, "\t"+`.section .note.GNU-split-stack,"",@progbits`+"\n")
+
+	if cfg.BuildN || cfg.BuildX {
+		for _, line := range bytes.Split(buf.Bytes(), []byte("\n")) {
+			b.Showcmd("", "echo '%s' >> %s", line, sfile)
+		}
+		if cfg.BuildN {
+			return sfile, nil
+		}
+	}
+
+	if err := ioutil.WriteFile(sfile, buf.Bytes(), 0666); err != nil {
+		return "", err
+	}
+
+	return sfile, nil
 }
 
 // buildID returns the build ID found in the given file.
@@ -216,25 +355,11 @@ func (b *Builder) buildID(file string) string {
 
 // fileHash returns the content hash of the named file.
 func (b *Builder) fileHash(file string) string {
-	b.id.Lock()
-	id := b.fileHashCache[file]
-	b.id.Unlock()
-
-	if id != "" {
-		return id
-	}
-
-	sum, err := cache.HashFile(file)
+	sum, err := cache.FileHash(file)
 	if err != nil {
 		return ""
 	}
-	id = hashToString(sum)
-
-	b.id.Lock()
-	b.fileHashCache[file] = id
-	b.id.Unlock()
-
-	return id
+	return hashToString(sum)
 }
 
 // useCache tries to satisfy the action a, which has action ID actionHash,
@@ -246,14 +371,19 @@ func (b *Builder) fileHash(file string) string {
 // and returns false. When useCache returns false the expectation is that
 // the caller will build the target and then call updateBuildID to finish the
 // build ID computation.
+// When useCache returns false, it may have initiated buffering of output
+// during a's work. The caller should defer b.flushOutput(a), to make sure
+// that flushOutput is eventually called regardless of whether the action
+// succeeds. The flushOutput call must happen after updateBuildID.
 func (b *Builder) useCache(a *Action, p *load.Package, actionHash cache.ActionID, target string) bool {
 	// The second half of the build ID here is a placeholder for the content hash.
 	// It's important that the overall buildID be unlikely verging on impossible
 	// to appear in the output by chance, but that should be taken care of by
 	// the actionID half; if it also appeared in the input that would be like an
 	// engineered 96-bit partial SHA256 collision.
+	a.actionID = actionHash
 	actionID := hashToString(actionHash)
-	contentID := "(MISSING CONTENT ID)" // same length has hashToString result
+	contentID := actionID // temporary placeholder, likely unique
 	a.buildID = actionID + buildIDSeparator + contentID
 
 	// Executable binaries also record the main build ID in the middle.
@@ -289,6 +419,7 @@ func (b *Builder) useCache(a *Action, p *load.Package, actionHash cache.ActionID
 	// want the package for is to link a binary, and the binary is
 	// already up-to-date, then to avoid a rebuild, report the package
 	// as up-to-date as well. See "Build IDs" comment above.
+	// TODO(rsc): Rewrite this code to use a TryCache func on the link action.
 	if target != "" && !cfg.BuildA && a.Mode == "build" && len(a.triggers) == 1 && a.triggers[0].Mode == "link" {
 		buildID, err := buildid.ReadFile(target)
 		if err == nil {
@@ -319,6 +450,17 @@ func (b *Builder) useCache(a *Action, p *load.Package, actionHash cache.ActionID
 		}
 	}
 
+	// Special case for linking a test binary: if the only thing we
+	// want the binary for is to run the test, and the test result is cached,
+	// then to avoid the link step, report the link as up-to-date.
+	// We avoid the nested build ID problem in the previous special case
+	// by recording the test results in the cache under the action ID half.
+	if !cfg.BuildA && len(a.triggers) == 1 && a.triggers[0].TryCache != nil && a.triggers[0].TryCache(b, a.triggers[0]) {
+		a.Target = "DO NOT USE -  pseudo-cache Target"
+		a.built = "DO NOT USE - pseudo-cache built"
+		return true
+	}
+
 	if b.ComputeStaleOnly {
 		// Invoked during go list only to compute and record staleness.
 		if p := a.Package; p != nil && !p.Stale {
@@ -343,7 +485,48 @@ func (b *Builder) useCache(a *Action, p *load.Package, actionHash cache.ActionID
 		return true
 	}
 
+	// Check the build artifact cache.
+	// We treat hits in this cache as being "stale" for the purposes of go list
+	// (in effect, "stale" means whether p.Target is up-to-date),
+	// but we're still happy to use results from the build artifact cache.
+	if c := cache.Default(); c != nil {
+		if !cfg.BuildA {
+			entry, err := c.Get(actionHash)
+			if err == nil {
+				file := c.OutputFile(entry.OutputID)
+				info, err1 := os.Stat(file)
+				buildID, err2 := buildid.ReadFile(file)
+				if err1 == nil && err2 == nil && info.Size() == entry.Size {
+					stdout, stdoutEntry, err := c.GetBytes(cache.Subkey(a.actionID, "stdout"))
+					if err == nil {
+						if len(stdout) > 0 {
+							if cfg.BuildX || cfg.BuildN {
+								b.Showcmd("", "%s  # internal", joinUnambiguously(str.StringList("cat", c.OutputFile(stdoutEntry.OutputID))))
+							}
+							if !cfg.BuildN {
+								b.Print(string(stdout))
+							}
+						}
+						a.built = file
+						a.Target = "DO NOT USE - using cache"
+						a.buildID = buildID
+						return true
+					}
+				}
+			}
+		}
+
+		// Begin saving output for later writing to cache.
+		a.output = []byte{}
+	}
+
 	return false
+}
+
+// flushOutput flushes the output being queued in a.
+func (b *Builder) flushOutput(a *Action) {
+	b.Print(string(a.output))
+	a.output = nil
 }
 
 // updateBuildID updates the build ID in the target written by action a.
@@ -352,9 +535,13 @@ func (b *Builder) useCache(a *Action, p *load.Package, actionHash cache.ActionID
 // a.buildID to record as the build ID in the resulting package or binary.
 // updateBuildID computes the final content ID and updates the build IDs
 // in the binary.
-func (b *Builder) updateBuildID(a *Action, target string) error {
+//
+// Keep in sync with src/cmd/buildid/buildid.go
+func (b *Builder) updateBuildID(a *Action, target string, rewrite bool) error {
 	if cfg.BuildX || cfg.BuildN {
-		b.Showcmd("", "%s # internal", joinUnambiguously(str.StringList(base.Tool("buildid"), "-w", target)))
+		if rewrite {
+			b.Showcmd("", "%s # internal", joinUnambiguously(str.StringList(base.Tool("buildid"), "-w", target)))
+		}
 		if cfg.BuildN {
 			return nil
 		}
@@ -381,17 +568,49 @@ func (b *Builder) updateBuildID(a *Action, target string) error {
 		// Assume the user specified -buildid= to override what we were going to choose.
 		return nil
 	}
-	w, err := os.OpenFile(target, os.O_WRONLY, 0)
-	if err != nil {
-		return err
+
+	if rewrite {
+		w, err := os.OpenFile(target, os.O_WRONLY, 0)
+		if err != nil {
+			return err
+		}
+		err = buildid.Rewrite(w, matches, newID)
+		if err != nil {
+			w.Close()
+			return err
+		}
+		if err := w.Close(); err != nil {
+			return err
+		}
 	}
-	err = buildid.Rewrite(w, matches, newID)
-	if err != nil {
-		w.Close()
-		return err
+
+	// Cache package builds, but not binaries (link steps).
+	// The expectation is that binaries are not reused
+	// nearly as often as individual packages, and they're
+	// much larger, so the cache-footprint-to-utility ratio
+	// of binaries is much lower for binaries.
+	// Not caching the link step also makes sure that repeated "go run" at least
+	// always rerun the linker, so that they don't get too fast.
+	// (We don't want people thinking go is a scripting language.)
+	// Note also that if we start caching binaries, then we will
+	// copy the binaries out of the cache to run them, and then
+	// that will mean the go process is itself writing a binary
+	// and then executing it, so we will need to defend against
+	// ETXTBSY problems as discussed in exec.go and golang.org/issue/22220.
+	if c := cache.Default(); c != nil && a.Mode == "build" {
+		r, err := os.Open(target)
+		if err == nil {
+			if a.output == nil {
+				panic("internal error: a.output not set")
+			}
+			outputID, _, err := c.Put(a.actionID, r)
+			if err == nil && cfg.BuildX {
+				b.Showcmd("", "%s # internal", joinUnambiguously(str.StringList("cp", target, c.OutputFile(outputID))))
+			}
+			c.PutBytes(cache.Subkey(a.actionID, "stdout"), a.output)
+			r.Close()
+		}
 	}
-	if err := w.Close(); err != nil {
-		return err
-	}
+
 	return nil
 }

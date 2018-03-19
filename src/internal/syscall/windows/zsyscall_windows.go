@@ -38,13 +38,16 @@ func errnoErr(e syscall.Errno) error {
 var (
 	modiphlpapi = syscall.NewLazyDLL(sysdll.Add("iphlpapi.dll"))
 	modkernel32 = syscall.NewLazyDLL(sysdll.Add("kernel32.dll"))
+	modws2_32   = syscall.NewLazyDLL(sysdll.Add("ws2_32.dll"))
 	modnetapi32 = syscall.NewLazyDLL(sysdll.Add("netapi32.dll"))
 	modadvapi32 = syscall.NewLazyDLL(sysdll.Add("advapi32.dll"))
+	modpsapi    = syscall.NewLazyDLL(sysdll.Add("psapi.dll"))
 
 	procGetAdaptersAddresses      = modiphlpapi.NewProc("GetAdaptersAddresses")
 	procGetComputerNameExW        = modkernel32.NewProc("GetComputerNameExW")
 	procMoveFileExW               = modkernel32.NewProc("MoveFileExW")
 	procGetModuleFileNameW        = modkernel32.NewProc("GetModuleFileNameW")
+	procWSASocketW                = modws2_32.NewProc("WSASocketW")
 	procGetACP                    = modkernel32.NewProc("GetACP")
 	procGetConsoleCP              = modkernel32.NewProc("GetConsoleCP")
 	procMultiByteToWideChar       = modkernel32.NewProc("MultiByteToWideChar")
@@ -57,6 +60,9 @@ var (
 	procOpenThreadToken           = modadvapi32.NewProc("OpenThreadToken")
 	procLookupPrivilegeValueW     = modadvapi32.NewProc("LookupPrivilegeValueW")
 	procAdjustTokenPrivileges     = modadvapi32.NewProc("AdjustTokenPrivileges")
+	procDuplicateTokenEx          = modadvapi32.NewProc("DuplicateTokenEx")
+	procSetTokenInformation       = modadvapi32.NewProc("SetTokenInformation")
+	procGetProcessMemoryInfo      = modpsapi.NewProc("GetProcessMemoryInfo")
 )
 
 func GetAdaptersAddresses(family uint32, flags uint32, reserved uintptr, adapterAddresses *IpAdapterAddresses, sizePointer *uint32) (errcode error) {
@@ -95,6 +101,19 @@ func GetModuleFileName(module syscall.Handle, fn *uint16, len uint32) (n uint32,
 	r0, _, e1 := syscall.Syscall(procGetModuleFileNameW.Addr(), 3, uintptr(module), uintptr(unsafe.Pointer(fn)), uintptr(len))
 	n = uint32(r0)
 	if n == 0 {
+		if e1 != 0 {
+			err = errnoErr(e1)
+		} else {
+			err = syscall.EINVAL
+		}
+	}
+	return
+}
+
+func WSASocket(af int32, typ int32, protocol int32, protinfo *syscall.WSAProtocolInfo, group uint32, flags uint32) (handle syscall.Handle, err error) {
+	r0, _, e1 := syscall.Syscall6(procWSASocketW.Addr(), 6, uintptr(af), uintptr(typ), uintptr(protocol), uintptr(unsafe.Pointer(protinfo)), uintptr(group), uintptr(flags))
+	handle = syscall.Handle(r0)
+	if handle == syscall.InvalidHandle {
 		if e1 != 0 {
 			err = errnoErr(e1)
 		} else {
@@ -235,6 +254,42 @@ func adjustTokenPrivileges(token syscall.Token, disableAllPrivileges bool, newst
 	r0, _, e1 := syscall.Syscall6(procAdjustTokenPrivileges.Addr(), 6, uintptr(token), uintptr(_p0), uintptr(unsafe.Pointer(newstate)), uintptr(buflen), uintptr(unsafe.Pointer(prevstate)), uintptr(unsafe.Pointer(returnlen)))
 	ret = uint32(r0)
 	if true {
+		if e1 != 0 {
+			err = errnoErr(e1)
+		} else {
+			err = syscall.EINVAL
+		}
+	}
+	return
+}
+
+func DuplicateTokenEx(hExistingToken syscall.Token, dwDesiredAccess uint32, lpTokenAttributes *syscall.SecurityAttributes, impersonationLevel uint32, tokenType TokenType, phNewToken *syscall.Token) (err error) {
+	r1, _, e1 := syscall.Syscall6(procDuplicateTokenEx.Addr(), 6, uintptr(hExistingToken), uintptr(dwDesiredAccess), uintptr(unsafe.Pointer(lpTokenAttributes)), uintptr(impersonationLevel), uintptr(tokenType), uintptr(unsafe.Pointer(phNewToken)))
+	if r1 == 0 {
+		if e1 != 0 {
+			err = errnoErr(e1)
+		} else {
+			err = syscall.EINVAL
+		}
+	}
+	return
+}
+
+func SetTokenInformation(tokenHandle syscall.Token, tokenInformationClass uint32, tokenInformation uintptr, tokenInformationLength uint32) (err error) {
+	r1, _, e1 := syscall.Syscall6(procSetTokenInformation.Addr(), 4, uintptr(tokenHandle), uintptr(tokenInformationClass), uintptr(tokenInformation), uintptr(tokenInformationLength), 0, 0)
+	if r1 == 0 {
+		if e1 != 0 {
+			err = errnoErr(e1)
+		} else {
+			err = syscall.EINVAL
+		}
+	}
+	return
+}
+
+func GetProcessMemoryInfo(handle syscall.Handle, memCounters *PROCESS_MEMORY_COUNTERS, cb uint32) (err error) {
+	r1, _, e1 := syscall.Syscall(procGetProcessMemoryInfo.Addr(), 3, uintptr(handle), uintptr(unsafe.Pointer(memCounters)), uintptr(cb))
+	if r1 == 0 {
 		if e1 != 0 {
 			err = errnoErr(e1)
 		} else {

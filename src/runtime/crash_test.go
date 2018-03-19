@@ -151,14 +151,14 @@ var (
 func checkStaleRuntime(t *testing.T) {
 	staleRuntimeOnce.Do(func() {
 		// 'go run' uses the installed copy of runtime.a, which may be out of date.
-		out, err := testenv.CleanCmdEnv(exec.Command(testenv.GoToolPath(t), "list", "-gcflags="+os.Getenv("GO_GCFLAGS"), "-f", "{{.Stale}}", "runtime")).CombinedOutput()
+		out, err := testenv.CleanCmdEnv(exec.Command(testenv.GoToolPath(t), "list", "-gcflags=all="+os.Getenv("GO_GCFLAGS"), "-f", "{{.Stale}}", "runtime")).CombinedOutput()
 		if err != nil {
 			staleRuntimeErr = fmt.Errorf("failed to execute 'go list': %v\n%v", err, string(out))
 			return
 		}
 		if string(out) != "false\n" {
 			t.Logf("go list -f {{.Stale}} runtime:\n%s", out)
-			out, err := testenv.CleanCmdEnv(exec.Command(testenv.GoToolPath(t), "list", "-gcflags="+os.Getenv("GO_GCFLAGS"), "-f", "{{.StaleReason}}", "runtime")).CombinedOutput()
+			out, err := testenv.CleanCmdEnv(exec.Command(testenv.GoToolPath(t), "list", "-gcflags=all="+os.Getenv("GO_GCFLAGS"), "-f", "{{.StaleReason}}", "runtime")).CombinedOutput()
 			if err != nil {
 				t.Logf("go list -f {{.StaleReason}} failed: %v", err)
 			}
@@ -606,4 +606,18 @@ retry:
 		return
 	}
 	t.Errorf("test ran %d times without producing expected output", tries)
+}
+
+func TestBadTraceback(t *testing.T) {
+	output := runTestProg(t, "testprog", "BadTraceback")
+	for _, want := range []string{
+		"runtime: unexpected return pc",
+		"called from 0xbad",
+		"00000bad",    // Smashed LR in hex dump
+		"<main.badLR", // Symbolization in hex dump (badLR1 or badLR2)
+	} {
+		if !strings.Contains(output, want) {
+			t.Errorf("output does not contain %q:\n%s", want, output)
+		}
+	}
 }

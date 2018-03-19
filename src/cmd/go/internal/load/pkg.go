@@ -16,6 +16,7 @@ import (
 	"sort"
 	"strings"
 	"unicode"
+	"unicode/utf8"
 
 	"cmd/go/internal/base"
 	"cmd/go/internal/cfg"
@@ -54,6 +55,8 @@ type PackagePublic struct {
 	StaleReason string `json:",omitempty"` // why is Stale true?
 
 	// Source files
+	// If you add to this list you MUST add to p.AllFiles (below) too.
+	// Otherwise file name security lists will not apply to any new additions.
 	GoFiles        []string `json:",omitempty"` // .go source files (excluding CgoFiles, TestGoFiles, XTestGoFiles)
 	CgoFiles       []string `json:",omitempty"` // .go sources files that import "C"
 	IgnoredGoFiles []string `json:",omitempty"` // .go sources ignored due to build constraints
@@ -85,10 +88,36 @@ type PackagePublic struct {
 	DepsErrors []*PackageError `json:",omitempty"` // errors loading dependencies
 
 	// Test information
+	// If you add to this list you MUST add to p.AllFiles (below) too.
+	// Otherwise file name security lists will not apply to any new additions.
 	TestGoFiles  []string `json:",omitempty"` // _test.go files in package
 	TestImports  []string `json:",omitempty"` // imports from TestGoFiles
 	XTestGoFiles []string `json:",omitempty"` // _test.go files outside package
 	XTestImports []string `json:",omitempty"` // imports from XTestGoFiles
+}
+
+// AllFiles returns the names of all the files considered for the package.
+// This is used for sanity and security checks, so we include all files,
+// even IgnoredGoFiles, because some subcommands consider them.
+// The go/build package filtered others out (like foo_wrongGOARCH.s)
+// and that's OK.
+func (p *Package) AllFiles() []string {
+	return str.StringList(
+		p.GoFiles,
+		p.CgoFiles,
+		p.IgnoredGoFiles,
+		p.CFiles,
+		p.CXXFiles,
+		p.MFiles,
+		p.HFiles,
+		p.FFiles,
+		p.SFiles,
+		p.SwigFiles,
+		p.SwigCXXFiles,
+		p.SysoFiles,
+		p.TestGoFiles,
+		p.XTestGoFiles,
+	)
 }
 
 type PackageInternal struct {
@@ -97,7 +126,8 @@ type PackageInternal struct {
 	Imports      []*Package           // this package's direct imports
 	RawImports   []string             // this package's original imports as they appear in the text of the program
 	ForceLibrary bool                 // this package is a library (even if named "main")
-	Cmdline      bool                 // defined by files listed on command line
+	CmdlineFiles bool                 // package built from files listed on command line
+	CmdlinePkg   bool                 // package listed on command line
 	Local        bool                 // imported via local path (./ or ../)
 	LocalPrefix  string               // interpret ./ and ../ imports relative to this prefix
 	ExeName      string               // desired name for temporary executable
@@ -105,6 +135,11 @@ type PackageInternal struct {
 	CoverVars    map[string]*CoverVar // variables created by coverage analysis
 	OmitDebug    bool                 // tell linker not to write debug information
 	GobinSubdir  bool                 // install target would be subdir of GOBIN
+
+	Asmflags   []string // -asmflags for this package
+	Gcflags    []string // -gcflags for this package
+	Ldflags    []string // -ldflags for this package
+	Gccgoflags []string // -gccgoflags for this package
 }
 
 type NoGoError struct {
@@ -345,7 +380,7 @@ func makeImportValid(r rune) rune {
 
 // Mode flags for loadImport and download (in get.go).
 const (
-	// useVendor means that loadImport should do vendor expansion
+	// UseVendor means that loadImport should do vendor expansion
 	// (provided the vendoring experiment is enabled).
 	// That is, useVendor means that the import path came from
 	// a source file and has not been vendor-expanded yet.
@@ -356,12 +391,12 @@ const (
 	// disallowVendor will reject direct use of paths containing /vendor/.
 	UseVendor = 1 << iota
 
-	// getTestDeps is for download (part of "go get") and indicates
+	// GetTestDeps is for download (part of "go get") and indicates
 	// that test dependencies should be fetched too.
 	GetTestDeps
 )
 
-// loadImport scans the directory named by path, which must be an import path,
+// LoadImport scans the directory named by path, which must be an import path,
 // but possibly a local import path (an absolute file system path or one beginning
 // with ./ or ../). A local relative path is interpreted relative to srcDir.
 // It returns a *Package describing the package found in that directory.
@@ -377,8 +412,14 @@ func LoadImport(path, srcDir string, parent *Package, stk *ImportStack, importPo
 	importPath := path
 	origPath := path
 	isLocal := build.IsLocalImport(path)
+	var debugDeprecatedImportcfgDir string
 	if isLocal {
 		importPath = dirToImportPath(filepath.Join(srcDir, path))
+	} else if DebugDeprecatedImportcfg.enabled {
+		if d, i := DebugDeprecatedImportcfg.lookup(parent, path); d != "" {
+			debugDeprecatedImportcfgDir = d
+			importPath = i
+		}
 	} else if mode&UseVendor != 0 {
 		// We do our own vendor resolution, because we want to
 		// find out the key to use in packageCache without the
@@ -400,20 +441,26 @@ func LoadImport(path, srcDir string, parent *Package, stk *ImportStack, importPo
 		// Load package.
 		// Import always returns bp != nil, even if an error occurs,
 		// in order to return partial information.
-		//
-		// TODO: After Go 1, decide when to pass build.AllowBinary here.
-		// See issue 3268 for mistakes to avoid.
-		buildMode := build.ImportComment
-		if mode&UseVendor == 0 || path != origPath {
-			// Not vendoring, or we already found the vendored path.
-			buildMode |= build.IgnoreVendor
+		var bp *build.Package
+		var err error
+		if debugDeprecatedImportcfgDir != "" {
+			bp, err = cfg.BuildContext.ImportDir(debugDeprecatedImportcfgDir, 0)
+		} else if DebugDeprecatedImportcfg.enabled {
+			bp = new(build.Package)
+			err = fmt.Errorf("unknown import path %q: not in import cfg", importPath)
+		} else {
+			buildMode := build.ImportComment
+			if mode&UseVendor == 0 || path != origPath {
+				// Not vendoring, or we already found the vendored path.
+				buildMode |= build.IgnoreVendor
+			}
+			bp, err = cfg.BuildContext.Import(path, srcDir, buildMode)
 		}
-		bp, err := cfg.BuildContext.Import(path, srcDir, buildMode)
 		bp.ImportPath = importPath
 		if cfg.GOBIN != "" {
 			bp.BinDir = cfg.GOBIN
 		}
-		if err == nil && !isLocal && bp.ImportComment != "" && bp.ImportComment != path &&
+		if debugDeprecatedImportcfgDir == "" && err == nil && !isLocal && bp.ImportComment != "" && bp.ImportComment != path &&
 			!strings.Contains(path, "/vendor/") && !strings.HasPrefix(path, "vendor/") {
 			err = fmt.Errorf("code in directory %s expects import %q", bp.Dir, bp.ImportComment)
 		}
@@ -422,7 +469,7 @@ func LoadImport(path, srcDir string, parent *Package, stk *ImportStack, importPo
 			p = setErrorPos(p, importPos)
 		}
 
-		if origPath != cleanImport(origPath) {
+		if debugDeprecatedImportcfgDir == "" && origPath != cleanImport(origPath) {
 			p.Error = &PackageError{
 				ImportStack: stk.Copy(),
 				Err:         fmt.Sprintf("non-canonical import path: %q should be %q", origPath, pathpkg.Clean(origPath)),
@@ -499,19 +546,26 @@ func isDir(path string) bool {
 // x/vendor/path, vendor/path, or else stay path if none of those exist.
 // VendoredImportPath returns the expanded path or, if no expansion is found, the original.
 func VendoredImportPath(parent *Package, path string) (found string) {
+	if DebugDeprecatedImportcfg.enabled {
+		if d, i := DebugDeprecatedImportcfg.lookup(parent, path); d != "" {
+			return i
+		}
+		return path
+	}
+
 	if parent == nil || parent.Root == "" {
 		return path
 	}
 
 	dir := filepath.Clean(parent.Dir)
 	root := filepath.Join(parent.Root, "src")
-	if !hasFilePathPrefix(dir, root) || parent.ImportPath != "command-line-arguments" && filepath.Join(root, parent.ImportPath) != dir {
+	if !str.HasFilePathPrefix(dir, root) || parent.ImportPath != "command-line-arguments" && filepath.Join(root, parent.ImportPath) != dir {
 		// Look for symlinks before reporting error.
 		dir = expandPath(dir)
 		root = expandPath(root)
 	}
 
-	if !hasFilePathPrefix(dir, root) || len(dir) <= len(root) || dir[len(root)] != filepath.Separator || parent.ImportPath != "command-line-arguments" && !parent.Internal.Local && filepath.Join(root, parent.ImportPath) != dir {
+	if !str.HasFilePathPrefix(dir, root) || len(dir) <= len(root) || dir[len(root)] != filepath.Separator || parent.ImportPath != "command-line-arguments" && !parent.Internal.Local && filepath.Join(root, parent.ImportPath) != dir {
 		base.Fatalf("unexpected directory layout:\n"+
 			"	import path: %s\n"+
 			"	root: %s\n"+
@@ -655,14 +709,14 @@ func disallowInternal(srcDir string, p *Package, stk *ImportStack) *Package {
 		i-- // rewind over slash in ".../internal"
 	}
 	parent := p.Dir[:i+len(p.Dir)-len(p.ImportPath)]
-	if hasFilePathPrefix(filepath.Clean(srcDir), filepath.Clean(parent)) {
+	if str.HasFilePathPrefix(filepath.Clean(srcDir), filepath.Clean(parent)) {
 		return p
 	}
 
 	// Look for symlinks before reporting error.
 	srcDir = expandPath(srcDir)
 	parent = expandPath(parent)
-	if hasFilePathPrefix(filepath.Clean(srcDir), filepath.Clean(parent)) {
+	if str.HasFilePathPrefix(filepath.Clean(srcDir), filepath.Clean(parent)) {
 		return p
 	}
 
@@ -755,14 +809,14 @@ func disallowVendorVisibility(srcDir string, p *Package, stk *ImportStack) *Pack
 		return p
 	}
 	parent := p.Dir[:truncateTo]
-	if hasFilePathPrefix(filepath.Clean(srcDir), filepath.Clean(parent)) {
+	if str.HasFilePathPrefix(filepath.Clean(srcDir), filepath.Clean(parent)) {
 		return p
 	}
 
 	// Look for symlinks before reporting error.
 	srcDir = expandPath(srcDir)
 	parent = expandPath(parent)
-	if hasFilePathPrefix(filepath.Clean(srcDir), filepath.Clean(parent)) {
+	if str.HasFilePathPrefix(filepath.Clean(srcDir), filepath.Clean(parent)) {
 		return p
 	}
 
@@ -836,6 +890,26 @@ var foldPath = make(map[string]string)
 // be the result of calling build.Context.Import.
 func (p *Package) load(stk *ImportStack, bp *build.Package, err error) {
 	p.copyBuild(bp)
+
+	// Decide whether p was listed on the command line.
+	// Given that load is called while processing the command line,
+	// you might think we could simply pass a flag down into load
+	// saying whether we are loading something named on the command
+	// line or something to satisfy an import. But the first load of a
+	// package named on the command line may be as a dependency
+	// of an earlier package named on the command line, not when we
+	// get to that package during command line processing.
+	// For example "go test fmt reflect" will load reflect as a dependency
+	// of fmt before it attempts to load as a command-line argument.
+	// Because loads are cached, the later load will be a no-op,
+	// so it is important that the first load can fill in CmdlinePkg correctly.
+	// Hence the call to an explicit matching check here.
+	p.Internal.CmdlinePkg = isCmdlinePkg(p)
+
+	p.Internal.Asmflags = BuildAsmflags.For(p)
+	p.Internal.Gcflags = BuildGcflags.For(p)
+	p.Internal.Ldflags = BuildLdflags.For(p)
+	p.Internal.Gccgoflags = BuildGccgoflags.For(p)
 
 	// The localPrefix is the path we interpret ./ imports relative to.
 	// Synthesized main packages sometimes override this.
@@ -932,11 +1006,21 @@ func (p *Package) load(stk *ImportStack, bp *build.Package, err error) {
 
 	// Cgo translation adds imports of "runtime/cgo" and "syscall",
 	// except for certain packages, to avoid circular dependencies.
-	if len(p.CgoFiles) > 0 && (!p.Standard || !cgoExclude[p.ImportPath]) {
+	if p.UsesCgo() && (!p.Standard || !cgoExclude[p.ImportPath]) {
 		addImport("runtime/cgo")
 	}
-	if len(p.CgoFiles) > 0 && (!p.Standard || !cgoSyscallExclude[p.ImportPath]) {
+	if p.UsesCgo() && (!p.Standard || !cgoSyscallExclude[p.ImportPath]) {
 		addImport("syscall")
+	}
+
+	// SWIG adds imports of some standard packages.
+	if p.UsesSwig() {
+		addImport("runtime/cgo")
+		addImport("syscall")
+		addImport("sync")
+
+		// TODO: The .swig and .swigcxx files can use
+		// %go_import directives to import other packages.
 	}
 
 	// The linker loads implicit dependencies.
@@ -946,50 +1030,47 @@ func (p *Package) load(stk *ImportStack, bp *build.Package, err error) {
 		}
 	}
 
-	// If runtime/internal/sys/zversion.go changes, it very likely means the
-	// compiler has been recompiled with that new version, so all existing
-	// archives are now stale. Make everything appear to import runtime/internal/sys,
-	// so that in this situation everything will appear stale and get recompiled.
-	// Due to the rules for visibility of internal packages, things outside runtime
-	// must import runtime, and runtime imports runtime/internal/sys.
-	// Content-based staleness that includes a check of the compiler version
-	// will make this hack unnecessary; once that lands, this whole comment
-	// and switch statement should be removed.
-	switch {
-	case p.Standard && p.ImportPath == "runtime/internal/sys":
-		// nothing
-	case p.Standard && p.ImportPath == "unsafe":
-		// nothing - not a real package, and used by runtime
-	case p.Standard && strings.HasPrefix(p.ImportPath, "runtime"):
-		addImport("runtime/internal/sys")
-	default:
-		addImport("runtime")
-	}
-
 	// Check for case-insensitive collision of input files.
 	// To avoid problems on case-insensitive files, we reject any package
 	// where two different input files have equal names under a case-insensitive
 	// comparison.
-	f1, f2 := str.FoldDup(str.StringList(
-		p.GoFiles,
-		p.CgoFiles,
-		p.IgnoredGoFiles,
-		p.CFiles,
-		p.CXXFiles,
-		p.MFiles,
-		p.HFiles,
-		p.FFiles,
-		p.SFiles,
-		p.SysoFiles,
-		p.SwigFiles,
-		p.SwigCXXFiles,
-		p.TestGoFiles,
-		p.XTestGoFiles,
-	))
+	inputs := p.AllFiles()
+	f1, f2 := str.FoldDup(inputs)
 	if f1 != "" {
 		p.Error = &PackageError{
 			ImportStack: stk.Copy(),
 			Err:         fmt.Sprintf("case-insensitive file name collision: %q and %q", f1, f2),
+		}
+		return
+	}
+
+	// If first letter of input file is ASCII, it must be alphanumeric.
+	// This avoids files turning into flags when invoking commands,
+	// and other problems we haven't thought of yet.
+	// Also, _cgo_ files must be generated by us, not supplied.
+	// They are allowed to have //go:cgo_ldflag directives.
+	// The directory scan ignores files beginning with _,
+	// so we shouldn't see any _cgo_ files anyway, but just be safe.
+	for _, file := range inputs {
+		if !SafeArg(file) || strings.HasPrefix(file, "_cgo_") {
+			p.Error = &PackageError{
+				ImportStack: stk.Copy(),
+				Err:         fmt.Sprintf("invalid input file name %q", file),
+			}
+			return
+		}
+	}
+	if name := pathpkg.Base(p.ImportPath); !SafeArg(name) {
+		p.Error = &PackageError{
+			ImportStack: stk.Copy(),
+			Err:         fmt.Sprintf("invalid input directory name %q", name),
+		}
+		return
+	}
+	if !SafeArg(p.ImportPath) {
+		p.Error = &PackageError{
+			ImportStack: stk.Copy(),
+			Err:         fmt.Sprintf("invalid import path %q", p.ImportPath),
 		}
 		return
 	}
@@ -1117,12 +1198,30 @@ func (p *Package) load(stk *ImportStack, bp *build.Package, err error) {
 	}
 }
 
-// LinkerDeps returns the list of linker-induced dependencies for p.
+// SafeArg reports whether arg is a "safe" command-line argument,
+// meaning that when it appears in a command-line, it probably
+// doesn't have some special meaning other than its own name.
+// Obviously args beginning with - are not safe (they look like flags).
+// Less obviously, args beginning with @ are not safe (they look like
+// GNU binutils flagfile specifiers, sometimes called "response files").
+// To be conservative, we reject almost any arg beginning with non-alphanumeric ASCII.
+// We accept leading . _ and / as likely in file system paths.
+// There is a copy of this function in cmd/compile/internal/gc/noder.go.
+func SafeArg(name string) bool {
+	if name == "" {
+		return false
+	}
+	c := name[0]
+	return '0' <= c && c <= '9' || 'A' <= c && c <= 'Z' || 'a' <= c && c <= 'z' || c == '.' || c == '_' || c == '/' || c >= utf8.RuneSelf
+}
+
+// LinkerDeps returns the list of linker-induced dependencies for main package p.
 func LinkerDeps(p *Package) []string {
-	var deps []string
+	// Everything links runtime.
+	deps := []string{"runtime"}
 
 	// External linking mode forces an import of runtime/cgo.
-	if cfg.ExternalLinkingForced() {
+	if externalLinkingForced(p) {
 		deps = append(deps, "runtime/cgo")
 	}
 	// On ARM with GOARM=5, it forces an import of math, for soft floating point.
@@ -1139,6 +1238,46 @@ func LinkerDeps(p *Package) []string {
 	}
 
 	return deps
+}
+
+// externalLinkingForced reports whether external linking is being
+// forced even for programs that do not use cgo.
+func externalLinkingForced(p *Package) bool {
+	// Some targets must use external linking even inside GOROOT.
+	switch cfg.BuildContext.GOOS {
+	case "android":
+		return true
+	case "darwin":
+		switch cfg.BuildContext.GOARCH {
+		case "arm", "arm64":
+			return true
+		}
+	}
+
+	if !cfg.BuildContext.CgoEnabled {
+		return false
+	}
+	// Currently build modes c-shared, pie (on systems that do not
+	// support PIE with internal linking mode (currently all
+	// systems: issue #18968)), plugin, and -linkshared force
+	// external linking mode, as of course does
+	// -ldflags=-linkmode=external. External linking mode forces
+	// an import of runtime/cgo.
+	pieCgo := cfg.BuildBuildmode == "pie"
+	linkmodeExternal := false
+	if p != nil {
+		ldflags := BuildLdflags.For(p)
+		for i, a := range ldflags {
+			if a == "-linkmode=external" {
+				linkmodeExternal = true
+			}
+			if a == "-linkmode" && i+1 < len(ldflags) && ldflags[i+1] == "external" {
+				linkmodeExternal = true
+			}
+		}
+	}
+
+	return cfg.BuildBuildmode == "c-shared" || cfg.BuildBuildmode == "plugin" || pieCgo || cfg.BuildLinkshared || linkmodeExternal
 }
 
 // mkAbs rewrites list, which must be paths relative to p.Dir,
@@ -1421,7 +1560,7 @@ func GoFilesPackage(gofiles []string) *Package {
 	bp, err := ctxt.ImportDir(dir, 0)
 	pkg := new(Package)
 	pkg.Internal.Local = true
-	pkg.Internal.Cmdline = true
+	pkg.Internal.CmdlineFiles = true
 	stk.Push("main")
 	pkg.load(&stk, bp, err)
 	stk.Pop()
@@ -1441,4 +1580,148 @@ func GoFilesPackage(gofiles []string) *Package {
 	}
 
 	return pkg
+}
+
+// TestPackagesFor returns package structs ptest, the package p plus
+// its test files, and pxtest, the external tests of package p.
+// pxtest may be nil. If there are no test files, forceTest decides
+// whether this returns a new package struct or just returns p.
+func TestPackagesFor(p *Package, forceTest bool) (ptest, pxtest *Package, err error) {
+	var imports, ximports []*Package
+	var stk ImportStack
+	stk.Push(p.ImportPath + " (test)")
+	rawTestImports := str.StringList(p.TestImports)
+	for i, path := range p.TestImports {
+		p1 := LoadImport(path, p.Dir, p, &stk, p.Internal.Build.TestImportPos[path], UseVendor)
+		if p1.Error != nil {
+			return nil, nil, p1.Error
+		}
+		if len(p1.DepsErrors) > 0 {
+			err := p1.DepsErrors[0]
+			err.Pos = "" // show full import stack
+			return nil, nil, err
+		}
+		if str.Contains(p1.Deps, p.ImportPath) || p1.ImportPath == p.ImportPath {
+			// Same error that loadPackage returns (via reusePackage) in pkg.go.
+			// Can't change that code, because that code is only for loading the
+			// non-test copy of a package.
+			err := &PackageError{
+				ImportStack:   testImportStack(stk[0], p1, p.ImportPath),
+				Err:           "import cycle not allowed in test",
+				IsImportCycle: true,
+			}
+			return nil, nil, err
+		}
+		p.TestImports[i] = p1.ImportPath
+		imports = append(imports, p1)
+	}
+	stk.Pop()
+	stk.Push(p.ImportPath + "_test")
+	pxtestNeedsPtest := false
+	rawXTestImports := str.StringList(p.XTestImports)
+	for i, path := range p.XTestImports {
+		p1 := LoadImport(path, p.Dir, p, &stk, p.Internal.Build.XTestImportPos[path], UseVendor)
+		if p1.Error != nil {
+			return nil, nil, p1.Error
+		}
+		if len(p1.DepsErrors) > 0 {
+			err := p1.DepsErrors[0]
+			err.Pos = "" // show full import stack
+			return nil, nil, err
+		}
+		if p1.ImportPath == p.ImportPath {
+			pxtestNeedsPtest = true
+		} else {
+			ximports = append(ximports, p1)
+		}
+		p.XTestImports[i] = p1.ImportPath
+	}
+	stk.Pop()
+
+	// Test package.
+	if len(p.TestGoFiles) > 0 || forceTest {
+		ptest = new(Package)
+		*ptest = *p
+		ptest.GoFiles = nil
+		ptest.GoFiles = append(ptest.GoFiles, p.GoFiles...)
+		ptest.GoFiles = append(ptest.GoFiles, p.TestGoFiles...)
+		ptest.Target = ""
+		// Note: The preparation of the vet config requires that common
+		// indexes in ptest.Imports, ptest.Internal.Imports, and ptest.Internal.RawImports
+		// all line up (but RawImports can be shorter than the others).
+		// That is, for 0 ≤ i < len(RawImports),
+		// RawImports[i] is the import string in the program text,
+		// Imports[i] is the expanded import string (vendoring applied or relative path expanded away),
+		// and Internal.Imports[i] is the corresponding *Package.
+		// Any implicitly added imports appear in Imports and Internal.Imports
+		// but not RawImports (because they were not in the source code).
+		// We insert TestImports, imports, and rawTestImports at the start of
+		// these lists to preserve the alignment.
+		ptest.Imports = str.StringList(p.TestImports, p.Imports)
+		ptest.Internal.Imports = append(imports, p.Internal.Imports...)
+		ptest.Internal.RawImports = str.StringList(rawTestImports, p.Internal.RawImports)
+		ptest.Internal.ForceLibrary = true
+		ptest.Internal.Build = new(build.Package)
+		*ptest.Internal.Build = *p.Internal.Build
+		m := map[string][]token.Position{}
+		for k, v := range p.Internal.Build.ImportPos {
+			m[k] = append(m[k], v...)
+		}
+		for k, v := range p.Internal.Build.TestImportPos {
+			m[k] = append(m[k], v...)
+		}
+		ptest.Internal.Build.ImportPos = m
+	} else {
+		ptest = p
+	}
+
+	// External test package.
+	if len(p.XTestGoFiles) > 0 {
+		pxtest = &Package{
+			PackagePublic: PackagePublic{
+				Name:       p.Name + "_test",
+				ImportPath: p.ImportPath + "_test",
+				Root:       p.Root,
+				Dir:        p.Dir,
+				GoFiles:    p.XTestGoFiles,
+				Imports:    p.XTestImports,
+			},
+			Internal: PackageInternal{
+				LocalPrefix: p.Internal.LocalPrefix,
+				Build: &build.Package{
+					ImportPos: p.Internal.Build.XTestImportPos,
+				},
+				Imports:    ximports,
+				RawImports: rawXTestImports,
+
+				Asmflags:   p.Internal.Asmflags,
+				Gcflags:    p.Internal.Gcflags,
+				Ldflags:    p.Internal.Ldflags,
+				Gccgoflags: p.Internal.Gccgoflags,
+			},
+		}
+		if pxtestNeedsPtest {
+			pxtest.Internal.Imports = append(pxtest.Internal.Imports, ptest)
+		}
+	}
+
+	return ptest, pxtest, nil
+}
+
+func testImportStack(top string, p *Package, target string) []string {
+	stk := []string{top, p.ImportPath}
+Search:
+	for p.ImportPath != target {
+		for _, p1 := range p.Internal.Imports {
+			if p1.ImportPath == target || str.Contains(p1.Deps, target) {
+				stk = append(stk, p1.ImportPath)
+				p = p1
+				continue Search
+			}
+		}
+		// Can't happen, but in case it does...
+		stk = append(stk, "<lost path to cycle>")
+		break
+	}
+	return stk
 }

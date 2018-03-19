@@ -80,11 +80,12 @@ func (p *parser) updateBase(line, col uint, text string) {
 		p.error_at(p.pos_at(line, col+uint(i+1)), "invalid line number: "+nstr)
 		return
 	}
-	absFile := text[:i]
+	filename := text[:i]
+	absFilename := filename
 	if p.fileh != nil {
-		absFile = p.fileh(absFile)
+		absFilename = p.fileh(filename)
 	}
-	p.base = src.NewLinePragmaBase(src.MakePos(p.base.Pos().Base(), line, col), absFile, uint(n))
+	p.base = src.NewLinePragmaBase(src.MakePos(p.base.Pos().Base(), line, col), filename, absFilename, uint(n))
 }
 
 func (p *parser) got(tok token) bool {
@@ -1766,10 +1767,14 @@ func (p *parser) header(keyword token) (init SimpleStmt, cond Expr, post SimpleS
 		pos src.Pos
 		lit string // valid if pos.IsKnown()
 	}
-	if p.tok == _Semi {
-		semi.pos = p.pos()
-		semi.lit = p.lit
-		p.next()
+	if p.tok != _Lbrace {
+		if p.tok == _Semi {
+			semi.pos = p.pos()
+			semi.lit = p.lit
+			p.next()
+		} else {
+			p.want(_Semi)
+		}
 		if keyword == _For {
 			if p.tok != _Semi {
 				if p.tok == _Lbrace {

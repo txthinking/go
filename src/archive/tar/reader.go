@@ -95,6 +95,7 @@ loop:
 			if hdr.Typeflag == TypeXGlobalHeader {
 				mergePAX(hdr, paxHdrs)
 				return &Header{
+					Name:       hdr.Name,
 					Typeflag:   hdr.Typeflag,
 					Xattrs:     hdr.Xattrs,
 					PAXRecords: hdr.PAXRecords,
@@ -192,7 +193,6 @@ func (tr *Reader) handleSparseFile(hdr *Header, rawHdr *block) error {
 		}
 		sph := invertSparseEntries(spd, hdr.Size)
 		tr.curr = &sparseFileReader{tr.curr, sph, 0}
-		hdr.SparseHoles = append([]SparseEntry{}, sph...)
 	}
 	return err
 }
@@ -238,9 +238,8 @@ func (tr *Reader) readGNUSparsePAXHeaders(hdr *Header) (sparseDatas, error) {
 	// Read the sparse map according to the appropriate format.
 	if is1x0 {
 		return readGNUSparseMap1x0(tr.curr)
-	} else {
-		return readGNUSparseMap0x1(hdr.PAXRecords)
 	}
+	return readGNUSparseMap0x1(hdr.PAXRecords)
 }
 
 // mergePAX merges paxHdrs into hdr for all relevant fields of Header.
@@ -487,7 +486,7 @@ func (tr *Reader) readOldGNUSparseMap(hdr *Header, blk *block) (sparseDatas, err
 			if p.err != nil {
 				return nil, p.err
 			}
-			spd = append(spd, SparseEntry{Offset: offset, Length: length})
+			spd = append(spd, sparseEntry{Offset: offset, Length: length})
 		}
 
 		if s.IsExtended()[0] > 0 {
@@ -567,7 +566,7 @@ func readGNUSparseMap1x0(r io.Reader) (sparseDatas, error) {
 		if err1 != nil || err2 != nil {
 			return nil, ErrHeader
 		}
-		spd = append(spd, SparseEntry{Offset: offset, Length: length})
+		spd = append(spd, sparseEntry{Offset: offset, Length: length})
 	}
 	return spd, nil
 }
@@ -601,7 +600,7 @@ func readGNUSparseMap0x1(paxHdrs map[string]string) (sparseDatas, error) {
 		if err1 != nil || err2 != nil {
 			return nil, ErrHeader
 		}
-		spd = append(spd, SparseEntry{Offset: offset, Length: length})
+		spd = append(spd, sparseEntry{Offset: offset, Length: length})
 		sparseMap = sparseMap[2:]
 	}
 	return spd, nil
@@ -628,14 +627,17 @@ func (tr *Reader) Read(b []byte) (int, error) {
 	return n, err
 }
 
-// WriteTo writes the content of the current file to w.
+// writeTo writes the content of the current file to w.
 // The bytes written matches the number of remaining bytes in the current file.
 //
 // If the current file is sparse and w is an io.WriteSeeker,
-// then WriteTo uses Seek to skip past holes defined in Header.SparseHoles,
+// then writeTo uses Seek to skip past holes defined in Header.SparseHoles,
 // assuming that skipped regions are filled with NULs.
 // This always writes the last byte to ensure w is the right size.
-func (tr *Reader) WriteTo(w io.Writer) (int64, error) {
+//
+// TODO(dsnet): Re-export this when adding sparse file support.
+// See https://golang.org/issue/22735
+func (tr *Reader) writeTo(w io.Writer) (int64, error) {
 	if tr.err != nil {
 		return 0, tr.err
 	}
@@ -674,11 +676,12 @@ func (fr *regFileReader) WriteTo(w io.Writer) (int64, error) {
 	return io.Copy(w, struct{ io.Reader }{fr})
 }
 
-func (rf regFileReader) LogicalRemaining() int64 {
-	return rf.nb
+func (fr regFileReader) LogicalRemaining() int64 {
+	return fr.nb
 }
-func (rf regFileReader) PhysicalRemaining() int64 {
-	return rf.nb
+
+func (fr regFileReader) PhysicalRemaining() int64 {
+	return fr.nb
 }
 
 // sparseFileReader is a fileReader for reading data from a sparse file entry.

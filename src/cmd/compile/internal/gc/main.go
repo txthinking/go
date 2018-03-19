@@ -48,6 +48,8 @@ var (
 	Debug_pctab        string
 	Debug_locationlist int
 	Debug_typecheckinl int
+	Debug_gendwarfinl  int
+	Debug_softfloat    int
 )
 
 // Debug arguments.
@@ -76,6 +78,8 @@ var debugtab = []struct {
 	{"pctab", "print named pc-value table", &Debug_pctab},
 	{"locationlists", "print information about DWARF location list creation", &Debug_locationlist},
 	{"typecheckinl", "eager typechecking of inline function bodies", &Debug_typecheckinl},
+	{"dwarfinl", "print information about DWARF inlined function creation", &Debug_gendwarfinl},
+	{"softfloat", "force compiler to emit soft-float code", &Debug_softfloat},
 }
 
 const debugHelpHeader = `usage: -d arg[,arg]* and arg is <key>[=<value>]
@@ -107,19 +111,6 @@ func hidePanic() {
 			errorexit()
 		}
 	}
-}
-
-func doversion() {
-	p := objabi.Expstring()
-	if p == objabi.DefaultExpstring() {
-		p = ""
-	}
-	sep := ""
-	if p != "" {
-		sep = " "
-	}
-	fmt.Printf("compile version %s%s%s\n", objabi.Version, sep, p)
-	os.Exit(0)
 }
 
 // supportsDynlink reports whether or not the code generator for the given
@@ -192,6 +183,7 @@ func Main(archInit func(*Arch)) {
 	objabi.Flagcount("E", "debug symbol export", &Debug['E'])
 	objabi.Flagfn1("I", "add `directory` to import search path", addidir)
 	objabi.Flagcount("K", "debug missing line numbers", &Debug['K'])
+	objabi.Flagcount("L", "show full file names in error messages", &Debug['L'])
 	objabi.Flagcount("N", "disable optimizations", &Debug['N'])
 	flag.BoolVar(&Debug_asm, "S", false, "print assembly listing")
 	objabi.AddVersionFlag() // -V
@@ -203,6 +195,7 @@ func Main(archInit func(*Arch)) {
 	flag.StringVar(&debugstr, "d", "", "print debug information about items in `list`; try -d help")
 	flag.BoolVar(&flagDWARF, "dwarf", true, "generate DWARF symbols")
 	flag.BoolVar(&Ctxt.Flag_locationlists, "dwarflocationlists", false, "add location lists to DWARF in optimized mode")
+	flag.IntVar(&genDwarfInline, "gendwarfinl", 2, "generate DWARF inline info records")
 	objabi.Flagcount("e", "no limit on number of errors reported", &Debug['e'])
 	objabi.Flagcount("f", "debug stack frames", &Debug['f'])
 	objabi.Flagcount("h", "halt on error", &Debug['h'])
@@ -259,6 +252,11 @@ func Main(archInit func(*Arch)) {
 	Ctxt.Debugvlog = Debug_vlog
 	if flagDWARF {
 		Ctxt.DebugInfo = debuginfo
+		Ctxt.GenAbstractFunc = genAbstractFunc
+		Ctxt.DwFixups = obj.NewDwarfFixupTable(Ctxt)
+	} else {
+		// turn off inline generation if no dwarf at all
+		genDwarfInline = 0
 	}
 
 	if flag.NArg() < 1 && debugstr != "help" && debugstr != "ssa/help" {
@@ -393,11 +391,18 @@ func Main(archInit func(*Arch)) {
 
 	// set via a -d flag
 	Ctxt.Debugpcln = Debug_pctab
+	if flagDWARF {
+		dwarf.EnableLogging(Debug_gendwarfinl != 0)
+	}
+
+	if Debug_softfloat != 0 {
+		thearch.SoftFloat = true
+	}
 
 	// enable inlining.  for now:
 	//	default: inlining on.  (debug['l'] == 1)
 	//	-l: inlining off  (debug['l'] == 0)
-	//	-ll, -lll: inlining on again, with extra debugging (debug['l'] > 1)
+	//	-l=2, -l=3: inlining on again, with extra debugging (debug['l'] > 1)
 	if Debug['l'] <= 1 {
 		Debug['l'] = 1 - Debug['l']
 	}
@@ -513,6 +518,8 @@ func Main(archInit func(*Arch)) {
 			fcount++
 		}
 	}
+	// With all types ckecked, it's now safe to verify map keys.
+	checkMapKeys()
 	timings.AddEvent(fcount, "funcs")
 
 	// Phase 4: Decide how to capture closed variables.
@@ -639,6 +646,15 @@ func Main(archInit func(*Arch)) {
 			// call graph.
 			nowritebarrierrecCheck.check()
 			nowritebarrierrecCheck = nil
+		}
+
+		// Finalize DWARF inline routine DIEs, then explicitly turn off
+		// DWARF inlining gen so as to avoid problems with generated
+		// method wrappers.
+		if Ctxt.DwFixups != nil {
+			Ctxt.DwFixups.Finalize(myimportpath, Debug_gendwarfinl != 0)
+			Ctxt.DwFixups = nil
+			genDwarfInline = 0
 		}
 
 		// Check whether any of the functions we have compiled have gigantic stack frames.
@@ -1214,8 +1230,8 @@ func concurrentBackendAllowed() bool {
 	if Debug_vlog || debugstr != "" || debuglive > 0 {
 		return false
 	}
-	// TODO: test and add builders for GOEXPERIMENT values, and enable
-	if os.Getenv("GOEXPERIMENT") != "" {
+	// TODO: Test and delete these conditions.
+	if objabi.Fieldtrack_enabled != 0 || objabi.Preemptibleloops_enabled != 0 || objabi.Clobberdead_enabled != 0 {
 		return false
 	}
 	// TODO: fix races and enable the following flags

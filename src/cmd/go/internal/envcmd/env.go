@@ -13,6 +13,7 @@ import (
 	"strings"
 
 	"cmd/go/internal/base"
+	"cmd/go/internal/cache"
 	"cmd/go/internal/cfg"
 	"cmd/go/internal/load"
 	"cmd/go/internal/work"
@@ -31,6 +32,8 @@ each named variable on its own line.
 
 The -json flag prints the environment in JSON format
 instead of as a shell script.
+
+For more about environment variables, see 'go help environment'.
 	`,
 }
 
@@ -47,6 +50,7 @@ func MkEnv() []cfg.EnvVar {
 	env := []cfg.EnvVar{
 		{Name: "GOARCH", Value: cfg.Goarch},
 		{Name: "GOBIN", Value: cfg.GOBIN},
+		{Name: "GOCACHE", Value: cache.DefaultDir()},
 		{Name: "GOEXE", Value: cfg.ExeSuffix},
 		{Name: "GOHOSTARCH", Value: runtime.GOARCH},
 		{Name: "GOHOSTOS", Value: runtime.GOOS},
@@ -54,6 +58,7 @@ func MkEnv() []cfg.EnvVar {
 		{Name: "GOPATH", Value: cfg.BuildContext.GOPATH},
 		{Name: "GORACE", Value: os.Getenv("GORACE")},
 		{Name: "GOROOT", Value: cfg.GOROOT},
+		{Name: "GOTMPDIR", Value: os.Getenv("GOTMPDIR")},
 		{Name: "GOTOOLDIR", Value: base.ToolDir},
 
 		// disable escape codes in clang errors
@@ -71,13 +76,15 @@ func MkEnv() []cfg.EnvVar {
 		env = append(env, cfg.EnvVar{Name: "GOARM", Value: cfg.GOARM})
 	case "386":
 		env = append(env, cfg.EnvVar{Name: "GO386", Value: cfg.GO386})
+	case "mips", "mipsle":
+		env = append(env, cfg.EnvVar{Name: "GOMIPS", Value: cfg.GOMIPS})
 	}
 
-	cc := cfg.DefaultCC
+	cc := cfg.DefaultCC(cfg.Goos, cfg.Goarch)
 	if env := strings.Fields(os.Getenv("CC")); len(env) > 0 {
 		cc = env[0]
 	}
-	cxx := cfg.DefaultCXX
+	cxx := cfg.DefaultCXX(cfg.Goos, cfg.Goarch)
 	if env := strings.Fields(os.Getenv("CXX")); len(env) > 0 {
 		cxx = env[0]
 	}
@@ -106,7 +113,12 @@ func findEnv(env []cfg.EnvVar, name string) string {
 func ExtraEnvVars() []cfg.EnvVar {
 	var b work.Builder
 	b.Init()
-	cppflags, cflags, cxxflags, fflags, ldflags := b.CFlags(&load.Package{})
+	cppflags, cflags, cxxflags, fflags, ldflags, err := b.CFlags(&load.Package{})
+	if err != nil {
+		// Should not happen - b.CFlags was given an empty package.
+		fmt.Fprintf(os.Stderr, "go: invalid cflags: %v\n", err)
+		return nil
+	}
 	cmd := b.GccCmd(".", "")
 	return []cfg.EnvVar{
 		// Note: Update the switch in runEnv below when adding to this list.

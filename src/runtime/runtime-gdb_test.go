@@ -22,11 +22,15 @@ import (
 
 func checkGdbEnvironment(t *testing.T) {
 	testenv.MustHaveGoBuild(t)
-	if runtime.GOOS == "darwin" {
+	switch runtime.GOOS {
+	case "darwin":
 		t.Skip("gdb does not work on darwin")
-	}
-	if runtime.GOOS == "linux" && runtime.GOARCH == "ppc64" {
-		t.Skip("skipping gdb tests on linux/ppc64; see golang.org/issue/17366")
+	case "netbsd":
+		t.Skip("gdb does not work with threads on NetBSD; see golang.org/issue/22893 and gnats.netbsd.org/52548")
+	case "linux":
+		if runtime.GOARCH == "ppc64" {
+			t.Skip("skipping gdb tests on linux/ppc64; see golang.org/issue/17366")
+		}
 	}
 	if final := os.Getenv("GOROOT_FINAL"); final != "" && runtime.GOROOT() != final {
 		t.Skip("gdb test can fail with GOROOT_FINAL pending")
@@ -76,7 +80,7 @@ import "fmt"
 import "runtime"
 var gslice []string
 func main() {
-	mapvar := make(map[string]string,5)
+	mapvar := make(map[string]string, 13)
 	mapvar["abc"] = "def"
 	mapvar["ghi"] = "jkl"
 	strvar := "abc"
@@ -106,8 +110,8 @@ func testGdbPython(t *testing.T, cgo bool) {
 		t.Skip("skipping because cgo is not enabled")
 	}
 
-	t.Parallel()
 	checkGdbEnvironment(t)
+	t.Parallel()
 	checkGdbVersion(t)
 	checkGdbPython(t)
 
@@ -198,8 +202,10 @@ func testGdbPython(t *testing.T, cgo bool) {
 		t.Fatalf("info goroutines failed: %s", bl)
 	}
 
-	printMapvarRe := regexp.MustCompile(`\Q = map[string]string = {["abc"] = "def", ["ghi"] = "jkl"}\E$`)
-	if bl := blocks["print mapvar"]; !printMapvarRe.MatchString(bl) {
+	printMapvarRe1 := regexp.MustCompile(`\Q = map[string]string = {["abc"] = "def", ["ghi"] = "jkl"}\E$`)
+	printMapvarRe2 := regexp.MustCompile(`\Q = map[string]string = {["ghi"] = "jkl", ["abc"] = "def"}\E$`)
+	if bl := blocks["print mapvar"]; !printMapvarRe1.MatchString(bl) &&
+		!printMapvarRe2.MatchString(bl) {
 		t.Fatalf("print mapvar failed: %s", bl)
 	}
 
@@ -212,7 +218,7 @@ func testGdbPython(t *testing.T, cgo bool) {
 	// a collection of scalar vars holding the fields. In such cases
 	// the DWARF variable location expression should be of the
 	// form "var.field" and not just "field".
-	infoLocalsRe := regexp.MustCompile(`^slicevar.len = `)
+	infoLocalsRe := regexp.MustCompile(`.*\sslicevar.cap = `)
 	if bl := blocks["info locals"]; !infoLocalsRe.MatchString(bl) {
 		t.Fatalf("info locals failed: %s", bl)
 	}
@@ -260,8 +266,8 @@ func TestGdbBacktrace(t *testing.T) {
 		testenv.SkipFlaky(t, 15603)
 	}
 
-	t.Parallel()
 	checkGdbEnvironment(t)
+	t.Parallel()
 	checkGdbVersion(t)
 
 	dir, err := ioutil.TempDir("", "go-build")
@@ -330,8 +336,8 @@ func main() {
 // TestGdbAutotmpTypes ensures that types of autotmp variables appear in .debug_info
 // See bug #17830.
 func TestGdbAutotmpTypes(t *testing.T) {
-	t.Parallel()
 	checkGdbEnvironment(t)
+	t.Parallel()
 	checkGdbVersion(t)
 
 	dir, err := ioutil.TempDir("", "go-build")
@@ -346,7 +352,7 @@ func TestGdbAutotmpTypes(t *testing.T) {
 	if err != nil {
 		t.Fatalf("failed to create file: %v", err)
 	}
-	cmd := exec.Command(testenv.GoToolPath(t), "build", "-gcflags=-N -l", "-o", "a.exe")
+	cmd := exec.Command(testenv.GoToolPath(t), "build", "-gcflags=all=-N -l", "-o", "a.exe")
 	cmd.Dir = dir
 	out, err := testenv.CleanCmdEnv(cmd).CombinedOutput()
 	if err != nil {
@@ -395,8 +401,8 @@ func main() {
 `
 
 func TestGdbConst(t *testing.T) {
-	t.Parallel()
 	checkGdbEnvironment(t)
+	t.Parallel()
 	checkGdbVersion(t)
 
 	dir, err := ioutil.TempDir("", "go-build")
@@ -411,7 +417,7 @@ func TestGdbConst(t *testing.T) {
 	if err != nil {
 		t.Fatalf("failed to create file: %v", err)
 	}
-	cmd := exec.Command(testenv.GoToolPath(t), "build", "-gcflags=-N -l", "-o", "a.exe")
+	cmd := exec.Command(testenv.GoToolPath(t), "build", "-gcflags=all=-N -l", "-o", "a.exe")
 	cmd.Dir = dir
 	out, err := testenv.CleanCmdEnv(cmd).CombinedOutput()
 	if err != nil {

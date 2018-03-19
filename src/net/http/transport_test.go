@@ -1113,15 +1113,14 @@ func TestTransportProxy(t *testing.T) {
 						Header:     make(Header),
 					}
 
-					log.Printf("Dialing %s", r.URL.Host)
 					targetConn, err := net.Dial("tcp", r.URL.Host)
 					if err != nil {
-						t.Errorf("net.Dial failed")
+						t.Errorf("net.Dial(%q) failed: %v", r.URL.Host, err)
 						return
 					}
 
 					if err := res.Write(clientConn); err != nil {
-						t.Errorf("Writing 200 OK failed")
+						t.Errorf("Writing 200 OK failed: %v", err)
 						return
 					}
 
@@ -4282,12 +4281,13 @@ func TestMissingStatusNoPanic(t *testing.T) {
 	shutdown := make(chan bool, 1)
 	done := make(chan bool)
 	fullAddrURL := fmt.Sprintf("http://%s", addr)
-	raw := `HTTP/1.1 400
-		Date: Wed, 30 Aug 2017 19:09:27 GMT
-		Content-Type: text/html; charset=utf-8
-		Content-Length: 10
-		Last-Modified: Wed, 30 Aug 2017 19:02:02 GMT
-		Vary: Accept-Encoding` + "\r\n\r\nAloha Olaa"
+	raw := "HTTP/1.1 400\r\n" +
+		"Date: Wed, 30 Aug 2017 19:09:27 GMT\r\n" +
+		"Content-Type: text/html; charset=utf-8\r\n" +
+		"Content-Length: 10\r\n" +
+		"Last-Modified: Wed, 30 Aug 2017 19:02:02 GMT\r\n" +
+		"Vary: Accept-Encoding\r\n\r\n" +
+		"Aloha Olaa"
 
 	go func() {
 		defer func() {
@@ -4349,6 +4349,12 @@ func TestNoBodyOnChunked304Response(t *testing.T) {
 		conn.Close()
 	}))
 	defer cst.close()
+
+	// Our test server above is sending back bogus data after the
+	// response (the "0\r\n\r\n" part), which causes the Transport
+	// code to log spam. Disable keep-alives so we never even try
+	// to reuse the connection.
+	cst.tr.DisableKeepAlives = true
 
 	res, err := cst.c.Get(cst.ts.URL)
 	if err != nil {

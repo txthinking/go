@@ -24,7 +24,7 @@ func TestOutput(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer os.RemoveAll(pkgdir)
-	out, err := exec.Command(testenv.GoToolPath(t), "install", "-race", "-pkgdir="+pkgdir, "-gcflags=-l", "testing").CombinedOutput()
+	out, err := exec.Command(testenv.GoToolPath(t), "install", "-race", "-pkgdir="+pkgdir, "-gcflags=all=-l", "testing").CombinedOutput()
 	if err != nil {
 		t.Fatalf("go install -race: %v\n%s", err, out)
 	}
@@ -57,7 +57,7 @@ func TestOutput(t *testing.T) {
 			t.Fatalf("failed to close file: %v", err)
 		}
 		// Pass -l to the compiler to test stack traces.
-		cmd := exec.Command(testenv.GoToolPath(t), test.run, "-race", "-pkgdir="+pkgdir, "-gcflags=-l", src)
+		cmd := exec.Command(testenv.GoToolPath(t), test.run, "-race", "-pkgdir="+pkgdir, "-gcflags=all=-l", src)
 		// GODEBUG spoils program output, GOMAXPROCS makes it flaky.
 		for _, env := range os.Environ() {
 			if strings.HasPrefix(env, "GODEBUG=") ||
@@ -185,6 +185,7 @@ import "testing"
 func TestFail(t *testing.T) {
 	done := make(chan bool)
 	x := 0
+	_ = x
 	go func() {
 		x = 42
 		done <- true
@@ -196,7 +197,7 @@ func TestFail(t *testing.T) {
 `, `
 ==================
 --- FAIL: TestFail \(0...s\)
-.*main_test.go:13: true
+.*main_test.go:14: true
 .*testing.go:.*: race detected during execution of test
 FAIL`},
 
@@ -275,6 +276,7 @@ import "testing"
 func TestFail(t *testing.T) {
 	done := make(chan bool)
 	x := 0
+	_ = x
 	go func() {
 		x = 42
 		done <- true

@@ -72,7 +72,11 @@ func (check *Checker) usage(scope *Scope) {
 	}
 
 	for _, scope := range scope.children {
-		check.usage(scope)
+		// Don't go inside closure scopes a second time;
+		// they are handled explicitly by funcBody.
+		if !scope.isFunc {
+			check.usage(scope)
+		}
 	}
 }
 
@@ -727,6 +731,9 @@ func (check *Checker) stmt(ctxt stmtContext, s ast.Stmt) {
 		// declaration, but the post statement must not."
 		if s, _ := s.Post.(*ast.AssignStmt); s != nil && s.Tok == token.DEFINE {
 			check.softErrorf(s.Pos(), "cannot declare in post statement")
+			// Don't call useLHS here because we want to use the lhs in
+			// this erroneous statement so that we don't get errors about
+			// these lhs variables being declared but not used.
 			check.use(s.Lhs...) // avoid follow-up errors
 		}
 		check.stmt(inner, s.Body)

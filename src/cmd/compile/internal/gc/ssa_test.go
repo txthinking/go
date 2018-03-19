@@ -8,6 +8,7 @@ import (
 	"bytes"
 	"internal/testenv"
 	"io/ioutil"
+	"os"
 	"os/exec"
 	"path/filepath"
 	"runtime"
@@ -17,21 +18,31 @@ import (
 
 // TODO: move all these tests elsewhere?
 // Perhaps teach test/run.go how to run them with a new action verb.
-func runTest(t *testing.T, filename string) {
+func runTest(t *testing.T, filename string, flags ...string) {
 	t.Parallel()
-	doTest(t, filename, "run")
+	doTest(t, filename, "run", flags...)
 }
-func buildTest(t *testing.T, filename string) {
+func buildTest(t *testing.T, filename string, flags ...string) {
 	t.Parallel()
-	doTest(t, filename, "build")
+	doTest(t, filename, "build", flags...)
 }
-func doTest(t *testing.T, filename string, kind string) {
+func doTest(t *testing.T, filename string, kind string, flags ...string) {
 	testenv.MustHaveGoBuild(t)
+	gotool := testenv.GoToolPath(t)
+
 	var stdout, stderr bytes.Buffer
-	cmd := exec.Command(testenv.GoToolPath(t), kind, filepath.Join("testdata", filename))
+	args := []string{kind}
+	if len(flags) == 0 {
+		args = append(args, "-gcflags=-d=ssa/check/on")
+	} else {
+		args = append(args, flags...)
+	}
+	args = append(args, filepath.Join("testdata", filename))
+	cmd := exec.Command(gotool, args...)
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr
-	if err := cmd.Run(); err != nil {
+	err := cmd.Run()
+	if err != nil {
 		t.Fatalf("Failed: %v:\nOut: %s\nStderr: %s\n", err, &stdout, &stderr)
 	}
 	if s := stdout.String(); s != "" {
@@ -48,8 +59,9 @@ func doTest(t *testing.T, filename string, kind string) {
 // of the generated test.
 func runGenTest(t *testing.T, filename, tmpname string, ev ...string) {
 	testenv.MustHaveGoRun(t)
+	gotool := testenv.GoToolPath(t)
 	var stdout, stderr bytes.Buffer
-	cmd := exec.Command("go", "run", filepath.Join("testdata", filename))
+	cmd := exec.Command(gotool, "run", filepath.Join("testdata", filename))
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr
 	if err := cmd.Run(); err != nil {
@@ -60,6 +72,7 @@ func runGenTest(t *testing.T, filename, tmpname string, ev ...string) {
 	if ok != nil {
 		t.Fatalf("Failed to create temporary directory")
 	}
+	defer os.RemoveAll(tmpdir)
 
 	rungo := filepath.Join(tmpdir, "run.go")
 	ok = ioutil.WriteFile(rungo, stdout.Bytes(), 0600)
@@ -69,30 +82,11 @@ func runGenTest(t *testing.T, filename, tmpname string, ev ...string) {
 
 	stdout.Reset()
 	stderr.Reset()
-	// Execute compile+link+run instead of "go run" to avoid applying -gcflags=-d=ssa/check/on
-	// to the runtime (especially over and over and over).
-	// compile
-	cmd = exec.Command("go", "tool", "compile", "-d=ssa/check/on", "-o", filepath.Join(tmpdir, "run.a"), rungo)
+	cmd = exec.Command(gotool, "run", "-gcflags=-d=ssa/check/on", rungo)
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr
 	cmd.Env = append(cmd.Env, ev...)
 	err := cmd.Run()
-	if err == nil {
-		// link
-		cmd = exec.Command("go", "tool", "link", "-o", filepath.Join(tmpdir, "run.exe"), filepath.Join(tmpdir, "run.a"))
-		cmd.Stdout = &stdout
-		cmd.Stderr = &stderr
-		cmd.Env = append(cmd.Env, ev...)
-		err = cmd.Run()
-	}
-	if err == nil {
-		// run
-		cmd = exec.Command(filepath.Join(tmpdir, "run.exe"))
-		cmd.Stdout = &stdout
-		cmd.Stderr = &stderr
-		cmd.Env = append(cmd.Env, ev...)
-		err = cmd.Run()
-	}
 	if err != nil {
 		t.Fatalf("Failed: %v:\nOut: %s\nStderr: %s\n", err, &stdout, &stderr)
 	}
@@ -125,6 +119,10 @@ func TestArithmetic(t *testing.T) { runTest(t, "arith.go") }
 
 // TestFP tests that both backends have the same result for floating point expressions.
 func TestFP(t *testing.T) { runTest(t, "fp.go") }
+
+func TestFPSoftFloat(t *testing.T) {
+	runTest(t, "fp.go", "-gcflags=-d=softfloat,ssa/check/on")
+}
 
 // TestArithmeticBoundary tests boundary results for arithmetic operations.
 func TestArithmeticBoundary(t *testing.T) { runTest(t, "arithBoundary.go") }

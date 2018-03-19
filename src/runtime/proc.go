@@ -782,8 +782,10 @@ func casgstatus(gp *g, oldval, newval uint32) {
 		// _Grunning or _Grunning|_Gscan; either way,
 		// we own gp.gcscanvalid, so it's safe to read.
 		// gp.gcscanvalid must not be true when we are running.
-		print("runtime: casgstatus ", hex(oldval), "->", hex(newval), " gp.status=", hex(gp.atomicstatus), " gp.gcscanvalid=true\n")
-		throw("casgstatus")
+		systemstack(func() {
+			print("runtime: casgstatus ", hex(oldval), "->", hex(newval), " gp.status=", hex(gp.atomicstatus), " gp.gcscanvalid=true\n")
+			throw("casgstatus")
+		})
 	}
 
 	// See http://golang.org/cl/21503 for justification of the yield delay.
@@ -1085,9 +1087,11 @@ func mhelpgc() {
 func startTheWorldWithSema(emitTraceEvent bool) int64 {
 	_g_ := getg()
 
-	_g_.m.locks++        // disable preemption because it can be holding p in a local var
-	gp := netpoll(false) // non-blocking
-	injectglist(gp)
+	_g_.m.locks++ // disable preemption because it can be holding p in a local var
+	if netpollinited() {
+		gp := netpoll(false) // non-blocking
+		injectglist(gp)
+	}
 	add := needaddgcproc()
 	lock(&sched.lock)
 
@@ -1282,13 +1286,7 @@ func mexit(osStack bool) {
 	unminit()
 
 	// Free the gsignal stack.
-	//
-	// If the signal stack was created outside Go, then gsignal
-	// will be non-nil, but unminitSignals set stack.lo to 0
-	// (e.g., Android's libc creates all threads with a signal
-	// stack, so it's possible for Go to exit them but not control
-	// the signal stack).
-	if m.gsignal != nil && m.gsignal.stack.lo != 0 {
+	if m.gsignal != nil {
 		stackfree(m.gsignal.stack)
 	}
 
@@ -2239,11 +2237,12 @@ top:
 
 	// Poll network.
 	// This netpoll is only an optimization before we resort to stealing.
-	// We can safely skip it if there a thread blocked in netpoll already.
-	// If there is any kind of logical race with that blocked thread
-	// (e.g. it has already returned from netpoll, but does not set lastpoll yet),
-	// this thread will do blocking netpoll below anyway.
-	if netpollinited() && sched.lastpoll != 0 {
+	// We can safely skip it if there are no waiters or a thread is blocked
+	// in netpoll already. If there is any kind of logical race with that
+	// blocked thread (e.g. it has already returned from netpoll, but does
+	// not set lastpoll yet), this thread will do blocking netpoll below
+	// anyway.
+	if netpollinited() && atomic.Load(&netpollWaiters) > 0 && atomic.Load64(&sched.lastpoll) != 0 {
 		if gp := netpoll(false); gp != nil { // non-blocking
 			// netpoll returns list of goroutines linked by schedlink.
 			injectglist(gp.schedlink.ptr())
@@ -2300,6 +2299,12 @@ stop:
 		return gp, false
 	}
 
+	// Before we drop our P, make a snapshot of the allp slice,
+	// which can change underfoot once we no longer block
+	// safe-points. We don't need to snapshot the contents because
+	// everything up to cap(allp) is immutable.
+	allpSnapshot := allp
+
 	// return P and block
 	lock(&sched.lock)
 	if sched.gcwaiting != 0 || _p_.runSafePointFn != 0 {
@@ -2339,7 +2344,7 @@ stop:
 	}
 
 	// check all runqueues once again
-	for _, _p_ := range allp {
+	for _, _p_ := range allpSnapshot {
 		if !runqempty(_p_) {
 			lock(&sched.lock)
 			_p_ = pidleget()
@@ -2669,6 +2674,15 @@ func goexit0(gp *g) {
 	gp.labels = nil
 	gp.timer = nil
 
+	if gcBlackenEnabled != 0 && gp.gcAssistBytes > 0 {
+		// Flush assist credit to the global pool. This gives
+		// better information to pacing if the application is
+		// rapidly creating an exiting goroutines.
+		scanCredit := int64(gcController.assistWorkPerByte * float64(gp.gcAssistBytes))
+		atomic.Xaddint64(&gcController.bgScanCredit, scanCredit)
+		gp.gcAssistBytes = 0
+	}
+
 	// Note that gp's stack scan is now "valid" because it has no
 	// stack.
 	gp.gcscanvalid = true
@@ -2927,7 +2941,9 @@ func exitsyscall(dummy int32) {
 	oldp := _g_.m.p.ptr()
 	if exitsyscallfast() {
 		if _g_.m.mcache == nil {
-			throw("lost mcache")
+			systemstack(func() {
+				throw("lost mcache")
+			})
 		}
 		if trace.enabled {
 			if oldp != _g_.m.p.ptr() || _g_.m.syscalltick != _g_.m.p.ptr().syscalltick {
@@ -2974,7 +2990,9 @@ func exitsyscall(dummy int32) {
 	mcall(exitsyscall0)
 
 	if _g_.m.mcache == nil {
-		throw("lost mcache")
+		systemstack(func() {
+			throw("lost mcache")
+		})
 	}
 
 	// Scheduler returned, so we're allowed to run now.
@@ -4237,7 +4255,7 @@ func sysmon() {
 		// poll network if not polled for more than 10ms
 		lastpoll := int64(atomic.Load64(&sched.lastpoll))
 		now := nanotime()
-		if lastpoll != 0 && lastpoll+10*1000*1000 < now {
+		if netpollinited() && lastpoll != 0 && lastpoll+10*1000*1000 < now {
 			atomic.Cas64(&sched.lastpoll, uint64(lastpoll), uint64(now))
 			gp := netpoll(false) // non-blocking - returns list of goroutines
 			if gp != nil {
@@ -4762,22 +4780,25 @@ func runqgrab(_p_ *p, batch *[256]guintptr, batchHead uint32, stealRunNextG bool
 			if stealRunNextG {
 				// Try to steal from _p_.runnext.
 				if next := _p_.runnext; next != 0 {
-					// Sleep to ensure that _p_ isn't about to run the g we
-					// are about to steal.
-					// The important use case here is when the g running on _p_
-					// ready()s another g and then almost immediately blocks.
-					// Instead of stealing runnext in this window, back off
-					// to give _p_ a chance to schedule runnext. This will avoid
-					// thrashing gs between different Ps.
-					// A sync chan send/recv takes ~50ns as of time of writing,
-					// so 3us gives ~50x overshoot.
-					if GOOS != "windows" {
-						usleep(3)
-					} else {
-						// On windows system timer granularity is 1-15ms,
-						// which is way too much for this optimization.
-						// So just yield.
-						osyield()
+					if _p_.status == _Prunning {
+						// Sleep to ensure that _p_ isn't about to run the g
+						// we are about to steal.
+						// The important use case here is when the g running
+						// on _p_ ready()s another g and then almost
+						// immediately blocks. Instead of stealing runnext
+						// in this window, back off to give _p_ a chance to
+						// schedule runnext. This will avoid thrashing gs
+						// between different Ps.
+						// A sync chan send/recv takes ~50ns as of time of
+						// writing, so 3us gives ~50x overshoot.
+						if GOOS != "windows" {
+							usleep(3)
+						} else {
+							// On windows system timer granularity is
+							// 1-15ms, which is way too much for this
+							// optimization. So just yield.
+							osyield()
+						}
 					}
 					if !_p_.runnext.cas(next, 0) {
 						continue

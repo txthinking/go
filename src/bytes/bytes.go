@@ -39,7 +39,7 @@ func explode(s []byte, n int) [][]byte {
 			break
 		}
 		_, size = utf8.DecodeRune(s)
-		a[na] = s[0:size]
+		a[na] = s[0:size:size]
 		s = s[size:]
 		na++
 	}
@@ -144,6 +144,10 @@ func IndexRune(s []byte, r rune) int {
 // code points in chars. It returns -1 if chars is empty or if there is no code
 // point in common.
 func IndexAny(s []byte, chars string) int {
+	if chars == "" {
+		// Avoid scanning all of s.
+		return -1
+	}
 	if len(s) > 8 {
 		if as, isASCII := makeASCIISet(chars); isASCII {
 			for i, c := range s {
@@ -176,6 +180,10 @@ func IndexAny(s []byte, chars string) int {
 // the Unicode code points in chars. It returns -1 if chars is empty or if
 // there is no code point in common.
 func LastIndexAny(s []byte, chars string) int {
+	if chars == "" {
+		// Avoid scanning all of s.
+		return -1
+	}
 	if len(s) > 8 {
 		if as, isASCII := makeASCIISet(chars); isASCII {
 			for i := len(s) - 1; i >= 0; i-- {
@@ -219,7 +227,7 @@ func genSplit(s, sep []byte, sepSave, n int) [][]byte {
 		if m < 0 {
 			break
 		}
-		a[i] = s[:m+sepSave]
+		a[i] = s[: m+sepSave : m+sepSave]
 		s = s[m+len(sep):]
 		i++
 	}
@@ -302,7 +310,7 @@ func Fields(s []byte) [][]byte {
 			i++
 			continue
 		}
-		a[na] = s[fieldStart:i]
+		a[na] = s[fieldStart:i:i]
 		na++
 		i++
 		// Skip spaces in between fields.
@@ -312,7 +320,7 @@ func Fields(s []byte) [][]byte {
 		fieldStart = i
 	}
 	if fieldStart < len(s) { // Last field might end at EOF.
-		a[na] = s[fieldStart:]
+		a[na] = s[fieldStart:len(s):len(s)]
 	}
 	return a
 }
@@ -363,7 +371,7 @@ func FieldsFunc(s []byte, f func(rune) bool) [][]byte {
 	// Create subslices from recorded field indices.
 	a := make([][]byte, len(spans))
 	for i, span := range spans {
-		a[i] = s[span.start:span.end]
+		a[i] = s[span.start:span.end:span.end]
 	}
 
 	return a
@@ -814,4 +822,47 @@ func EqualFold(s, t []byte) bool {
 
 	// One string is empty. Are both?
 	return len(s) == len(t)
+}
+
+func indexRabinKarp(s, sep []byte) int {
+	// Rabin-Karp search
+	hashsep, pow := hashStr(sep)
+	n := len(sep)
+	var h uint32
+	for i := 0; i < n; i++ {
+		h = h*primeRK + uint32(s[i])
+	}
+	if h == hashsep && Equal(s[:n], sep) {
+		return 0
+	}
+	for i := n; i < len(s); {
+		h *= primeRK
+		h += uint32(s[i])
+		h -= pow * uint32(s[i-n])
+		i++
+		if h == hashsep && Equal(s[i-n:i], sep) {
+			return i - n
+		}
+	}
+	return -1
+}
+
+// primeRK is the prime base used in Rabin-Karp algorithm.
+const primeRK = 16777619
+
+// hashStr returns the hash and the appropriate multiplicative
+// factor for use in Rabin-Karp algorithm.
+func hashStr(sep []byte) (uint32, uint32) {
+	hash := uint32(0)
+	for i := 0; i < len(sep); i++ {
+		hash = hash*primeRK + uint32(sep[i])
+	}
+	var pow, sq uint32 = 1, primeRK
+	for i := len(sep); i > 0; i >>= 1 {
+		if i&1 != 0 {
+			pow *= sq
+		}
+		sq *= sq
+	}
+	return hash, pow
 }

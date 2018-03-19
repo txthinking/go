@@ -64,18 +64,18 @@ import (
 // A ParseError is returned for parsing errors.
 // Line numbers are 1-indexed and columns are 0-indexed.
 type ParseError struct {
-	RecordLine int   // Line where the record starts
-	Line       int   // Line where the error occurred
-	Column     int   // Column (rune index) where the error occurred
-	Err        error // The actual error
+	StartLine int   // Line where the record starts
+	Line      int   // Line where the error occurred
+	Column    int   // Column (rune index) where the error occurred
+	Err       error // The actual error
 }
 
 func (e *ParseError) Error() string {
 	if e.Err == ErrFieldCount {
 		return fmt.Sprintf("record on line %d: %v", e.Line, e.Err)
 	}
-	if e.RecordLine != e.Line {
-		return fmt.Sprintf("record on line %d; parse error on line %d, column %d: %v", e.RecordLine, e.Line, e.Column, e.Err)
+	if e.StartLine != e.Line {
+		return fmt.Sprintf("record on line %d; parse error on line %d, column %d: %v", e.StartLine, e.Line, e.Column, e.Err)
 	}
 	return fmt.Sprintf("parse error on line %d, column %d: %v", e.Line, e.Column, e.Err)
 }
@@ -99,15 +99,24 @@ func validDelim(r rune) bool {
 // As returned by NewReader, a Reader expects input conforming to RFC 4180.
 // The exported fields can be changed to customize the details before the
 // first call to Read or ReadAll.
+//
+// The Reader converts all \r\n sequences in its input to plain \n,
+// including in multiline field values, so that the returned data does
+// not depend on which line-ending convention an input file uses.
 type Reader struct {
 	// Comma is the field delimiter.
 	// It is set to comma (',') by NewReader.
+	// Comma must be a valid rune and must not be \r, \n,
+	// or the Unicode replacement character (0xFFFD).
 	Comma rune
 
 	// Comment, if not 0, is the comment character. Lines beginning with the
 	// Comment character without preceding whitespace are ignored.
 	// With leading whitespace the Comment character becomes part of the
 	// field, even if TrimLeadingSpace is true.
+	// Comment must be a valid rune and must not be \r, \n,
+	// or the Unicode replacement character (0xFFFD).
+	// It must also not be equal to Comma.
 	Comment rune
 
 	// FieldsPerRecord is the number of expected fields per record.
@@ -215,17 +224,23 @@ func (r *Reader) readLine() ([]byte, error) {
 	}
 	if len(line) > 0 && err == io.EOF {
 		err = nil
+		// For backwards compatibility, drop trailing \r before EOF.
+		if line[len(line)-1] == '\r' {
+			line = line[:len(line)-1]
+		}
 	}
 	r.numLine++
+	// Normalize \r\n to \n on all input lines.
+	if n := len(line); n >= 2 && line[n-2] == '\r' && line[n-1] == '\n' {
+		line[n-2] = '\n'
+		line = line[:n-1]
+	}
 	return line, err
 }
 
-// lengthCRLF reports the number of bytes for a trailing "\r\n".
-func lengthCRLF(b []byte) int {
-	if j := len(b) - 1; j >= 0 && b[j] == '\n' {
-		if j := len(b) - 2; j >= 0 && b[j] == '\r' {
-			return 2
-		}
+// lengthNL reports the number of bytes for the trailing \n.
+func lengthNL(b []byte) int {
+	if len(b) > 0 && b[len(b)-1] == '\n' {
 		return 1
 	}
 	return 0
@@ -251,7 +266,7 @@ func (r *Reader) readRecord(dst []string) ([]string, error) {
 			line = nil
 			continue // Skip comment lines
 		}
-		if errRead == nil && len(line) == lengthCRLF(line) {
+		if errRead == nil && len(line) == lengthNL(line) {
 			line = nil
 			continue // Skip empty lines
 		}
@@ -281,13 +296,13 @@ parseField:
 			if i >= 0 {
 				field = field[:i]
 			} else {
-				field = field[:len(field)-lengthCRLF(field)]
+				field = field[:len(field)-lengthNL(field)]
 			}
 			// Check to make sure a quote does not appear in field.
 			if !r.LazyQuotes {
 				if j := bytes.IndexByte(field, '"'); j >= 0 {
 					col := utf8.RuneCount(fullLine[:len(fullLine)-len(line[j:])])
-					err = &ParseError{RecordLine: recLine, Line: r.numLine, Column: col, Err: ErrBareQuote}
+					err = &ParseError{StartLine: recLine, Line: r.numLine, Column: col, Err: ErrBareQuote}
 					break parseField
 				}
 			}
@@ -317,7 +332,7 @@ parseField:
 						line = line[commaLen:]
 						r.fieldIndexes = append(r.fieldIndexes, len(r.recordBuffer))
 						continue parseField
-					case lengthCRLF(line) == len(line):
+					case lengthNL(line) == len(line):
 						// `"\n` sequence (end of line).
 						r.fieldIndexes = append(r.fieldIndexes, len(r.recordBuffer))
 						break parseField
@@ -327,7 +342,7 @@ parseField:
 					default:
 						// `"*` sequence (invalid non-escaped quote).
 						col := utf8.RuneCount(fullLine[:len(fullLine)-len(line)-quoteLen])
-						err = &ParseError{RecordLine: recLine, Line: r.numLine, Column: col, Err: ErrQuote}
+						err = &ParseError{StartLine: recLine, Line: r.numLine, Column: col, Err: ErrQuote}
 						break parseField
 					}
 				} else if len(line) > 0 {
@@ -345,7 +360,7 @@ parseField:
 					// Abrupt end of file (EOF or error).
 					if !r.LazyQuotes && errRead == nil {
 						col := utf8.RuneCount(fullLine)
-						err = &ParseError{RecordLine: recLine, Line: r.numLine, Column: col, Err: ErrQuote}
+						err = &ParseError{StartLine: recLine, Line: r.numLine, Column: col, Err: ErrQuote}
 						break parseField
 					}
 					r.fieldIndexes = append(r.fieldIndexes, len(r.recordBuffer))
@@ -375,7 +390,7 @@ parseField:
 	// Check or update the expected fields per record.
 	if r.FieldsPerRecord > 0 {
 		if len(dst) != r.FieldsPerRecord && err == nil {
-			err = &ParseError{RecordLine: recLine, Line: recLine, Err: ErrFieldCount}
+			err = &ParseError{StartLine: recLine, Line: recLine, Err: ErrFieldCount}
 		}
 	} else if r.FieldsPerRecord == 0 {
 		r.FieldsPerRecord = len(dst)

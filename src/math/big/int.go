@@ -533,7 +533,6 @@ func (z *Int) GCD(x, y, a, b *Int) *Int {
 // See Jebelean, "Improving the multiprecision Euclidean algorithm",
 // Design and Implementation of Symbolic Computation Systems, pp 45-58.
 func (z *Int) lehmerGCD(a, b *Int) *Int {
-
 	// ensure a >= b
 	if a.abs.cmp(b.abs) < 0 {
 		a, b = b, a
@@ -551,7 +550,6 @@ func (z *Int) lehmerGCD(a, b *Int) *Int {
 
 	// loop invariant A >= B
 	for len(B.abs) > 1 {
-
 		// initialize the digits
 		var a1, a2, u0, u1, u2, v0, v1, v2 Word
 
@@ -581,7 +579,10 @@ func (z *Int) lehmerGCD(a, b *Int) *Int {
 		u0, u1, u2 = 0, 1, 0
 		v0, v1, v2 = 0, 0, 1
 
-		// calculate the quotient and cosequences using Collins' stopping condition
+		// Calculate the quotient and cosequences using Collins' stopping condition.
+		// Note that overflow of a Word is not possible when computing the remainder
+		// sequence and cosequences since the cosequence size is bounded by the input size.
+		// See section 4.2 of Jebelean for details.
 		for a2 >= v2 && a1-a2 >= v1+v2 {
 			q := a1 / a2
 			a1, a2 = a2, a1-q*a2
@@ -644,6 +645,9 @@ func (z *Int) lehmerGCD(a, b *Int) *Int {
 }
 
 // Rand sets z to a pseudo-random number in [0, n) and returns z.
+//
+// As this uses the math/rand package, it must not be used for
+// security-sensitive work. Use crypto/rand.Int instead.
 func (z *Int) Rand(rnd *rand.Rand, n *Int) *Int {
 	z.neg = false
 	if n.neg || len(n.abs) == 0 {

@@ -77,9 +77,12 @@ type Cmd struct {
 	Dir string
 
 	// Stdin specifies the process's standard input.
+	//
 	// If Stdin is nil, the process reads from the null device (os.DevNull).
+	//
 	// If Stdin is an *os.File, the process's standard input is connected
 	// directly to that file.
+	//
 	// Otherwise, during the execution of the command a separate
 	// goroutine reads from Stdin and delivers that data to the command
 	// over a pipe. In this case, Wait does not complete until the goroutine
@@ -92,8 +95,16 @@ type Cmd struct {
 	// If either is nil, Run connects the corresponding file descriptor
 	// to the null device (os.DevNull).
 	//
-	// If Stdout and Stderr are the same writer, and have a type that can be compared with ==,
-	// at most one goroutine at a time will call Write.
+	// If either is an *os.File, the corresponding output from the process
+	// is connected directly to that file.
+	//
+	// Otherwise, during the execution of the command a separate goroutine
+	// reads from the process over a pipe and delivers that data to the
+	// corresponding Writer. In this case, Wait does not complete until the
+	// goroutine reaches EOF or encounters an error.
+	//
+	// If Stdout and Stderr are the same writer, and have a type that can
+	// be compared with ==, at most one goroutine at a time will call Write.
 	Stdout io.Writer
 	Stderr io.Writer
 
@@ -190,7 +201,7 @@ func (c *Cmd) argv() []string {
 }
 
 // skipStdinCopyError optionally specifies a function which reports
-// whether the provided the stdin copy error should be ignored.
+// whether the provided stdin copy error should be ignored.
 // It is non-nil everywhere but Plan 9, which lacks EPIPE. See exec_posix.go.
 var skipStdinCopyError func(error) bool
 
@@ -282,6 +293,11 @@ func (c *Cmd) closeDescriptors(closers []io.Closer) {
 //
 // If the command starts but does not complete successfully, the error is of
 // type *ExitError. Other error types may be returned for other situations.
+//
+// If the calling goroutine has locked the operating system thread
+// with runtime.LockOSThread and modified any inheritable OS-level
+// thread state (for example, Linux or Plan 9 name spaces), the new
+// process will inherit the caller's thread state.
 func (c *Cmd) Run() error {
 	if err := c.Start(); err != nil {
 		return err
@@ -429,9 +445,8 @@ func (e *ExitError) Error() string {
 // error is of type *ExitError. Other error types may be
 // returned for I/O problems.
 //
-// If c.Stdin is not an *os.File, Wait also waits for the I/O loop
-// copying from c.Stdin into the process's standard input
-// to complete.
+// If any of c.Stdin, c.Stdout or c.Stderr are not an *os.File, Wait also waits
+// for the respective I/O loop copying to or from the process to complete.
 //
 // Wait releases any resources associated with the Cmd.
 func (c *Cmd) Wait() error {

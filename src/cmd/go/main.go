@@ -56,6 +56,7 @@ func init() {
 
 		help.HelpC,
 		help.HelpBuildmode,
+		help.HelpCache,
 		help.HelpFileType,
 		help.HelpGopath,
 		help.HelpEnvironment,
@@ -77,6 +78,7 @@ func main() {
 		base.Usage()
 	}
 
+	cfg.CmdName = args[0] // for error messages
 	if args[0] == "help" {
 		help.Help(args[1:])
 		return

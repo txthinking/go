@@ -523,6 +523,64 @@ func TestServeWithSlashRedirectKeepsQueryString(t *testing.T) {
 	}
 }
 
+func TestServeWithSlashRedirectForHostPatterns(t *testing.T) {
+	setParallel(t)
+	defer afterTest(t)
+
+	mux := NewServeMux()
+	mux.Handle("example.com/pkg/foo/", stringHandler("example.com/pkg/foo/"))
+	mux.Handle("example.com/pkg/bar", stringHandler("example.com/pkg/bar"))
+	mux.Handle("example.com/pkg/bar/", stringHandler("example.com/pkg/bar/"))
+	mux.Handle("example.com:3000/pkg/connect/", stringHandler("example.com:3000/pkg/connect/"))
+	mux.Handle("example.com:9000/", stringHandler("example.com:9000/"))
+	mux.Handle("/pkg/baz/", stringHandler("/pkg/baz/"))
+
+	tests := []struct {
+		method string
+		url    string
+		code   int
+		loc    string
+		want   string
+	}{
+		{"GET", "http://example.com/", 404, "", ""},
+		{"GET", "http://example.com/pkg/foo", 301, "/pkg/foo/", ""},
+		{"GET", "http://example.com/pkg/bar", 200, "", "example.com/pkg/bar"},
+		{"GET", "http://example.com/pkg/bar/", 200, "", "example.com/pkg/bar/"},
+		{"GET", "http://example.com/pkg/baz", 301, "/pkg/baz/", ""},
+		{"GET", "http://example.com:3000/pkg/foo", 301, "/pkg/foo/", ""},
+		{"CONNECT", "http://example.com/", 404, "", ""},
+		{"CONNECT", "http://example.com:3000/", 404, "", ""},
+		{"CONNECT", "http://example.com:9000/", 200, "", "example.com:9000/"},
+		{"CONNECT", "http://example.com/pkg/foo", 301, "/pkg/foo/", ""},
+		{"CONNECT", "http://example.com:3000/pkg/foo", 404, "", ""},
+		{"CONNECT", "http://example.com:3000/pkg/baz", 301, "/pkg/baz/", ""},
+		{"CONNECT", "http://example.com:3000/pkg/connect", 301, "/pkg/connect/", ""},
+	}
+
+	ts := httptest.NewServer(mux)
+	defer ts.Close()
+
+	for i, tt := range tests {
+		req, _ := NewRequest(tt.method, tt.url, nil)
+		w := httptest.NewRecorder()
+		mux.ServeHTTP(w, req)
+
+		if got, want := w.Code, tt.code; got != want {
+			t.Errorf("#%d: Status = %d; want = %d", i, got, want)
+		}
+
+		if tt.code == 301 {
+			if got, want := w.HeaderMap.Get("Location"), tt.loc; got != want {
+				t.Errorf("#%d: Location = %q; want = %q", i, got, want)
+			}
+		} else {
+			if got, want := w.HeaderMap.Get("Result"), tt.want; got != want {
+				t.Errorf("#%d: Result = %q; want = %q", i, got, want)
+			}
+		}
+	}
+}
+
 func BenchmarkServeMux(b *testing.B) {
 
 	type test struct {
@@ -686,12 +744,8 @@ func TestHTTP2WriteDeadlineExtendedOnNewRequest(t *testing.T) {
 		req = req.WithContext(ctx)
 
 		r, err := c.Do(req)
-		select {
-		case <-ctx.Done():
-			if ctx.Err() == context.DeadlineExceeded {
-				t.Fatalf("http2 Get #%d response timed out", i)
-			}
-		default:
+		if ctx.Err() == context.DeadlineExceeded {
+			t.Fatalf("http2 Get #%d response timed out", i)
 		}
 		if err != nil {
 			t.Fatalf("http2 Get #%d: %v", i, err)
@@ -3443,9 +3497,6 @@ func TestHeaderToWire(t *testing.T) {
 			handler: func(rw ResponseWriter, r *Request) {
 			},
 			check: func(got string) error {
-				if !strings.Contains(got, "Content-Type: text/plain") {
-					return errors.New("wrong content-type; want text/plain")
-				}
 				if !strings.Contains(got, "Content-Length: 0") {
 					return errors.New("want 0 content-length")
 				}
@@ -5454,7 +5505,11 @@ func TestServerCloseDeadlock(t *testing.T) {
 func TestServerKeepAlivesEnabled_h1(t *testing.T) { testServerKeepAlivesEnabled(t, h1Mode) }
 func TestServerKeepAlivesEnabled_h2(t *testing.T) { testServerKeepAlivesEnabled(t, h2Mode) }
 func testServerKeepAlivesEnabled(t *testing.T, h2 bool) {
-	setParallel(t)
+	if h2 {
+		restore := ExportSetH2GoawayTimeout(10 * time.Millisecond)
+		defer restore()
+	}
+	// Not parallel: messes with global variable. (http2goAwayTimeout)
 	defer afterTest(t)
 	cst := newClientServerTest(t, h2, HandlerFunc(func(w ResponseWriter, r *Request) {
 		fmt.Fprintf(w, "%v", r.RemoteAddr)
@@ -5481,32 +5536,54 @@ func testServerKeepAlivesEnabled(t *testing.T, h2 bool) {
 func TestServerCancelsReadTimeoutWhenIdle(t *testing.T) {
 	setParallel(t)
 	defer afterTest(t)
-	const timeout = 250 * time.Millisecond
-	ts := httptest.NewUnstartedServer(HandlerFunc(func(w ResponseWriter, r *Request) {
-		select {
-		case <-time.After(2 * timeout):
-			fmt.Fprint(w, "ok")
-		case <-r.Context().Done():
-			fmt.Fprint(w, r.Context().Err())
+	runTimeSensitiveTest(t, []time.Duration{
+		10 * time.Millisecond,
+		50 * time.Millisecond,
+		250 * time.Millisecond,
+		time.Second,
+		2 * time.Second,
+	}, func(t *testing.T, timeout time.Duration) error {
+		ts := httptest.NewUnstartedServer(HandlerFunc(func(w ResponseWriter, r *Request) {
+			select {
+			case <-time.After(2 * timeout):
+				fmt.Fprint(w, "ok")
+			case <-r.Context().Done():
+				fmt.Fprint(w, r.Context().Err())
+			}
+		}))
+		ts.Config.ReadTimeout = timeout
+		ts.Start()
+		defer ts.Close()
+
+		c := ts.Client()
+
+		res, err := c.Get(ts.URL)
+		if err != nil {
+			return fmt.Errorf("Get: %v", err)
 		}
-	}))
-	ts.Config.ReadTimeout = timeout
-	ts.Start()
-	defer ts.Close()
+		slurp, err := ioutil.ReadAll(res.Body)
+		res.Body.Close()
+		if err != nil {
+			return fmt.Errorf("Body ReadAll: %v", err)
+		}
+		if string(slurp) != "ok" {
+			return fmt.Errorf("got: %q, want ok", slurp)
+		}
+		return nil
+	})
+}
 
-	c := ts.Client()
-
-	res, err := c.Get(ts.URL)
-	if err != nil {
-		t.Fatal(err)
-	}
-	slurp, err := ioutil.ReadAll(res.Body)
-	res.Body.Close()
-	if err != nil {
-		t.Fatal(err)
-	}
-	if string(slurp) != "ok" {
-		t.Fatalf("Got: %q, want ok", slurp)
+// runTimeSensitiveTest runs test with the provided durations until one passes.
+// If they all fail, t.Fatal is called with the last one's duration and error value.
+func runTimeSensitiveTest(t *testing.T, durations []time.Duration, test func(t *testing.T, d time.Duration) error) {
+	for i, d := range durations {
+		err := test(t, d)
+		if err == nil {
+			return
+		}
+		if i == len(durations)-1 {
+			t.Fatalf("failed with duration %v: %v", d, err)
+		}
 	}
 }
 

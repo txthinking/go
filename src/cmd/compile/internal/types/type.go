@@ -15,11 +15,13 @@ import (
 // TODO(gri) try to eliminate soon
 type Node struct{ _ int }
 
+//go:generate stringer -type EType -trimprefix T
+
 // EType describes a kind of type.
 type EType uint8
 
 const (
-	Txxx = iota
+	Txxx EType = iota
 
 	TINT8
 	TUINT8
@@ -1391,7 +1393,7 @@ func Haspointers1(t *Type, ignoreNotInHeap bool) bool {
 		}
 		return false
 
-	case TPTR32, TPTR64:
+	case TPTR32, TPTR64, TSLICE:
 		return !(ignoreNotInHeap && t.Elem().NotInHeap())
 	}
 

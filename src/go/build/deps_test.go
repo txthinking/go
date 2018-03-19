@@ -154,12 +154,13 @@ var pkgDeps = map[string][]string{
 		"syscall",
 	},
 
-	"internal/poll": {"L0", "internal/race", "syscall", "time", "unicode/utf16", "unicode/utf8"},
-	"os":            {"L1", "os", "syscall", "time", "internal/poll", "internal/syscall/windows"},
-	"path/filepath": {"L2", "os", "syscall", "internal/syscall/windows"},
-	"io/ioutil":     {"L2", "os", "path/filepath", "time"},
-	"os/exec":       {"L2", "os", "context", "path/filepath", "syscall"},
-	"os/signal":     {"L2", "os", "syscall"},
+	"internal/poll":    {"L0", "internal/race", "syscall", "time", "unicode/utf16", "unicode/utf8", "internal/syscall/windows"},
+	"internal/testlog": {"L0"},
+	"os":               {"L1", "os", "syscall", "time", "internal/poll", "internal/syscall/windows", "internal/testlog"},
+	"path/filepath":    {"L2", "os", "syscall", "internal/syscall/windows"},
+	"io/ioutil":        {"L2", "os", "path/filepath", "time"},
+	"os/exec":          {"L2", "os", "context", "path/filepath", "syscall"},
+	"os/signal":        {"L2", "os", "syscall"},
 
 	// OS enables basic operating system functionality,
 	// but not direct use of package syscall, nor os/signal.
@@ -266,11 +267,11 @@ var pkgDeps = map[string][]string{
 	"math/big":                 {"L4"},
 	"mime":                     {"L4", "OS", "syscall", "internal/syscall/windows/registry"},
 	"mime/quotedprintable":     {"L4"},
-	"net/internal/socktest":    {"L4", "OS", "syscall"},
+	"net/internal/socktest":    {"L4", "OS", "syscall", "internal/syscall/windows"},
 	"net/url":                  {"L4"},
 	"plugin":                   {"L0", "OS", "CGO"},
 	"runtime/pprof/internal/profile": {"L4", "OS", "compress/gzip", "regexp"},
-	"testing/internal/testdeps":      {"L4", "runtime/pprof", "regexp"},
+	"testing/internal/testdeps":      {"L4", "internal/testlog", "runtime/pprof", "regexp"},
 	"text/scanner":                   {"L4", "OS"},
 	"text/template/parse":            {"L4"},
 
@@ -298,6 +299,9 @@ var pkgDeps = map[string][]string{
 
 	// Plan 9 alone needs io/ioutil and os.
 	"os/user": {"L4", "CGO", "io/ioutil", "os", "syscall"},
+
+	// Internal package used only for testing.
+	"os/signal/internal/pty": {"CGO", "fmt", "os", "syscall"},
 
 	// Basic networking.
 	// Because net must be used by any package that wants to
@@ -377,7 +381,8 @@ var pkgDeps = map[string][]string{
 	},
 	"crypto/x509": {
 		"L4", "CRYPTO-MATH", "OS", "CGO",
-		"crypto/x509/pkix", "encoding/pem", "encoding/hex", "net", "os/user", "syscall",
+		"crypto/x509/pkix", "encoding/pem", "encoding/hex", "net", "os/user", "syscall", "net/url",
+		"golang_org/x/crypto/cryptobyte", "golang_org/x/crypto/cryptobyte/asn1",
 	},
 	"crypto/x509/pkix": {"L4", "CRYPTO-MATH", "encoding/hex"},
 

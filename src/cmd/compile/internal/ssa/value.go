@@ -9,6 +9,7 @@ import (
 	"cmd/internal/src"
 	"fmt"
 	"math"
+	"sort"
 	"strings"
 )
 
@@ -120,6 +121,7 @@ func (v *Value) LongString() string {
 		}
 	}
 	if len(names) != 0 {
+		sort.Strings(names) // Otherwise a source of variation in debugging output.
 		s += " (" + strings.Join(names, ", ") + ")"
 	}
 	return s
@@ -319,4 +321,15 @@ func (v *Value) MemoryArg() *Value {
 		return m
 	}
 	return nil
+}
+
+// LackingPos indicates whether v is a value that is unlikely to have a correct
+// position assigned to it.  Ignoring such values leads to more user-friendly positions
+// assigned to nearby values and the blocks containing them.
+func (v *Value) LackingPos() bool {
+	// The exact definition of LackingPos is somewhat heuristically defined and may change
+	// in the future, for example if some of these operations are generated more carefully
+	// with respect to their source position.
+	return v.Op == OpVarDef || v.Op == OpVarKill || v.Op == OpVarLive || v.Op == OpPhi ||
+		(v.Op == OpFwdRef || v.Op == OpCopy) && v.Type == types.TypeMem
 }

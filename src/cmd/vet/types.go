@@ -62,7 +62,7 @@ func importType(path, name string) types.Type {
 	return nil
 }
 
-func (pkg *Package) check(fs *token.FileSet, astFiles []*ast.File) error {
+func (pkg *Package) check(fs *token.FileSet, astFiles []*ast.File) []error {
 	if stdImporter == nil {
 		if *source {
 			stdImporter = importer.For("source", nil)
@@ -76,13 +76,17 @@ func (pkg *Package) check(fs *token.FileSet, astFiles []*ast.File) error {
 	pkg.selectors = make(map[*ast.SelectorExpr]*types.Selection)
 	pkg.spans = make(map[types.Object]Span)
 	pkg.types = make(map[ast.Expr]types.TypeAndValue)
+
+	var allErrors []error
 	config := types.Config{
 		// We use the same importer for all imports to ensure that
 		// everybody sees identical packages for the given paths.
 		Importer: stdImporter,
 		// By providing a Config with our own error function, it will continue
-		// past the first error. There is no need for that function to do anything.
-		Error: func(error) {},
+		// past the first error. We collect them all for printing later.
+		Error: func(e error) {
+			allErrors = append(allErrors, e)
+		},
 
 		Sizes: archSizes,
 	}
@@ -93,6 +97,9 @@ func (pkg *Package) check(fs *token.FileSet, astFiles []*ast.File) error {
 		Uses:       pkg.uses,
 	}
 	typesPkg, err := config.Check(pkg.path, fs, astFiles, info)
+	if len(allErrors) == 0 && err != nil {
+		allErrors = append(allErrors, err)
+	}
 	pkg.typesPkg = typesPkg
 	// update spans
 	for id, obj := range pkg.defs {
@@ -101,7 +108,7 @@ func (pkg *Package) check(fs *token.FileSet, astFiles []*ast.File) error {
 	for id, obj := range pkg.uses {
 		pkg.growSpan(id, obj)
 	}
-	return err
+	return allErrors
 }
 
 // matchArgType reports an error if printf verb t is not appropriate
@@ -165,7 +172,7 @@ func (f *File) matchArgTypeInternal(t printfArgType, typ types.Type, arg ast.Exp
 			return true // %s matches []byte
 		}
 		// Recur: []int matches %d.
-		return t&argPointer != 0 || f.matchArgTypeInternal(t, typ.Elem().Underlying(), arg, inProgress)
+		return t&argPointer != 0 || f.matchArgTypeInternal(t, typ.Elem(), arg, inProgress)
 
 	case *types.Slice:
 		// Same as array.
@@ -262,7 +269,19 @@ func (f *File) matchArgTypeInternal(t printfArgType, typ types.Type, arg ast.Exp
 }
 
 func isConvertibleToString(typ types.Type) bool {
-	return types.AssertableTo(errorType, typ) || stringerType != nil && types.AssertableTo(stringerType, typ)
+	if bt, ok := typ.(*types.Basic); ok && bt.Kind() == types.UntypedNil {
+		// We explicitly don't want untyped nil, which is
+		// convertible to both of the interfaces below, as it
+		// would just panic anyway.
+		return false
+	}
+	if types.ConvertibleTo(typ, errorType) {
+		return true // via .Error()
+	}
+	if stringerType != nil && types.ConvertibleTo(typ, stringerType) {
+		return true // via .String()
+	}
+	return false
 }
 
 // hasBasicType reports whether x's type is a types.Basic with the given kind.

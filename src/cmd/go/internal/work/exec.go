@@ -18,9 +18,11 @@ import (
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"runtime"
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 
 	"cmd/go/internal/base"
 	"cmd/go/internal/cache"
@@ -51,6 +53,11 @@ func actionList(root *Action) []*Action {
 
 // do runs the action graph rooted at root.
 func (b *Builder) Do(root *Action) {
+	if c := cache.Default(); c != nil && !b.ComputeStaleOnly {
+		// If we're doing real work, take time at the end to trim the cache.
+		defer c.Trim()
+	}
+
 	// Build list of all actions, assigning depth-first post-order priority.
 	// The original implementation here was a true queue
 	// (using a channel) but it had the effect of getting
@@ -168,8 +175,8 @@ func (b *Builder) Do(root *Action) {
 
 // buildActionID computes the action ID for a build action.
 func (b *Builder) buildActionID(a *Action) cache.ActionID {
-	h := cache.NewHash("actionID")
 	p := a.Package
+	h := cache.NewHash("build " + p.ImportPath)
 
 	// Configuration independent of compiler toolchain.
 	// Note: buildmode has already been accounted for in buildGcflags
@@ -177,12 +184,20 @@ func (b *Builder) buildActionID(a *Action) cache.ActionID {
 	// same compiler settings and can reuse each other's results.
 	// If not, the reason is already recorded in buildGcflags.
 	fmt.Fprintf(h, "compile\n")
+	// The compiler hides the exact value of $GOROOT
+	// when building things in GOROOT,
+	// but it does not hide the exact value of $GOPATH.
+	// Include the full dir in that case.
+	// Assume b.WorkDir is being trimmed properly.
+	if !p.Goroot && !strings.HasPrefix(p.Dir, b.WorkDir) {
+		fmt.Fprintf(h, "dir %s\n", p.Dir)
+	}
 	fmt.Fprintf(h, "goos %s goarch %s\n", cfg.Goos, cfg.Goarch)
 	fmt.Fprintf(h, "import %q\n", p.ImportPath)
 	fmt.Fprintf(h, "omitdebug %v standard %v local %v prefix %q\n", p.Internal.OmitDebug, p.Standard, p.Internal.Local, p.Internal.LocalPrefix)
 	if len(p.CgoFiles)+len(p.SwigFiles) > 0 {
 		fmt.Fprintf(h, "cgo %q\n", b.toolID("cgo"))
-		cppflags, cflags, cxxflags, fflags, _ := b.CFlags(p)
+		cppflags, cflags, cxxflags, fflags, _, _ := b.CFlags(p)
 		fmt.Fprintf(h, "CC=%q %q %q\n", b.ccExe(), cppflags, cflags)
 		if len(p.CXXFiles)+len(p.SwigFiles) > 0 {
 			fmt.Fprintf(h, "CXX=%q %q\n", b.cxxExe(), cxxflags)
@@ -201,26 +216,55 @@ func (b *Builder) buildActionID(a *Action) cache.ActionID {
 	default:
 		base.Fatalf("buildActionID: unknown build toolchain %q", cfg.BuildToolchainName)
 	case "gc":
-		fmt.Fprintf(h, "compile %s %q\n", b.toolID("compile"), buildGcflags)
+		fmt.Fprintf(h, "compile %s %q %q\n", b.toolID("compile"), forcedGcflags, p.Internal.Gcflags)
 		if len(p.SFiles) > 0 {
-			fmt.Fprintf(h, "asm %q %q\n", b.toolID("asm"), buildAsmflags)
+			fmt.Fprintf(h, "asm %q %q %q\n", b.toolID("asm"), forcedAsmflags, p.Internal.Asmflags)
 		}
 		fmt.Fprintf(h, "GO$GOARCH=%s\n", os.Getenv("GO"+strings.ToUpper(cfg.BuildContext.GOARCH))) // GO386, GOARM, etc
 
 		// TODO(rsc): Convince compiler team not to add more magic environment variables,
 		// or perhaps restrict the environment variables passed to subprocesses.
 		magic := []string{
-			"GOEXPERIMENT",
 			"GOCLOBBERDEADHASH",
 			"GOSSAFUNC",
 			"GO_SSA_PHI_LOC_CUTOFF",
-			"GSHS_LOGFILE",
 			"GOSSAHASH",
 		}
 		for _, env := range magic {
 			if x := os.Getenv(env); x != "" {
 				fmt.Fprintf(h, "magic %s=%s\n", env, x)
 			}
+		}
+		if os.Getenv("GOSSAHASH") != "" {
+			for i := 0; ; i++ {
+				env := fmt.Sprintf("GOSSAHASH%d", i)
+				x := os.Getenv(env)
+				if x == "" {
+					break
+				}
+				fmt.Fprintf(h, "magic %s=%s\n", env, x)
+			}
+		}
+		if os.Getenv("GSHS_LOGFILE") != "" {
+			// Clumsy hack. Compiler writes to this log file,
+			// so do not allow use of cache at all.
+			// We will still write to the cache but it will be
+			// essentially unfindable.
+			fmt.Fprintf(h, "nocache %d\n", time.Now().UnixNano())
+		}
+
+	case "gccgo":
+		id, err := b.gccgoToolID(BuildToolchain.compiler(), "go")
+		if err != nil {
+			base.Fatalf("%v", err)
+		}
+		fmt.Fprintf(h, "compile %s %q %q\n", id, forcedGccgoflags, p.Internal.Gccgoflags)
+		fmt.Fprintf(h, "pkgpath %s\n", gccgoPkgpath(p))
+		if len(p.SFiles) > 0 {
+			id, err = b.gccgoToolID(BuildToolchain.compiler(), "assembler-with-cpp")
+			// Ignore error; different assembler versions
+			// are unlikely to make any difference anyhow.
+			fmt.Fprintf(h, "asm %q\n", id)
 		}
 	}
 
@@ -244,7 +288,7 @@ func (b *Builder) buildActionID(a *Action) cache.ActionID {
 	for _, a1 := range a.Deps {
 		p1 := a1.Package
 		if p1 != nil {
-			fmt.Fprintf(h, "import %s %s\n", p1.ImportPath, a1.buildID)
+			fmt.Fprintf(h, "import %s %s\n", p1.ImportPath, contentID(a1.buildID))
 		}
 	}
 
@@ -258,11 +302,35 @@ func (b *Builder) build(a *Action) (err error) {
 	cached := false
 	if !p.BinaryOnly {
 		if b.useCache(a, p, b.buildActionID(a), p.Target) {
-			if !a.needVet {
+			// If this build triggers a header install, run cgo to get the header.
+			// TODO(rsc): Once we can cache multiple file outputs from an action,
+			// the header should be cached, and then this awful test can be deleted.
+			// Need to look for install header actions depending on this action,
+			// or depending on a link that depends on this action.
+			needHeader := false
+			if (a.Package.UsesCgo() || a.Package.UsesSwig()) && (cfg.BuildBuildmode == "c-archive" || cfg.BuildBuildmode == "c-shared") {
+				for _, t1 := range a.triggers {
+					if t1.Mode == "install header" {
+						needHeader = true
+						goto CheckedHeader
+					}
+				}
+				for _, t1 := range a.triggers {
+					for _, t2 := range t1.triggers {
+						if t2.Mode == "install header" {
+							needHeader = true
+							goto CheckedHeader
+						}
+					}
+				}
+			}
+		CheckedHeader:
+			if b.ComputeStaleOnly || !a.needVet && !needHeader {
 				return nil
 			}
 			cached = true
 		}
+		defer b.flushOutput(a)
 	}
 
 	defer func() {
@@ -314,7 +382,7 @@ func (b *Builder) build(a *Action) (err error) {
 		}
 	}
 
-	var gofiles, cgofiles, objdirCgofiles, cfiles, sfiles, cxxfiles, objects, cgoObjects, pcCFLAGS, pcLDFLAGS []string
+	var gofiles, cgofiles, cfiles, sfiles, cxxfiles, objects, cgoObjects, pcCFLAGS, pcLDFLAGS []string
 
 	gofiles = append(gofiles, a.Package.GoFiles...)
 	cgofiles = append(cgofiles, a.Package.CgoFiles...)
@@ -332,13 +400,47 @@ func (b *Builder) build(a *Action) (err error) {
 	// Each run will generate two files, a .go file and a .c or .cxx file.
 	// The .go file will use import "C" and is to be processed by cgo.
 	if a.Package.UsesSwig() {
-		outGo, outC, outCXX, err := b.swig(a.Package, objdir, pcCFLAGS)
+		outGo, outC, outCXX, err := b.swig(a, a.Package, objdir, pcCFLAGS)
 		if err != nil {
 			return err
 		}
-		objdirCgofiles = append(objdirCgofiles, outGo...)
+		cgofiles = append(cgofiles, outGo...)
 		cfiles = append(cfiles, outC...)
 		cxxfiles = append(cxxfiles, outCXX...)
+	}
+
+	// If we're doing coverage, preprocess the .go files and put them in the work directory
+	if a.Package.Internal.CoverMode != "" {
+		for i, file := range str.StringList(gofiles, cgofiles) {
+			var sourceFile string
+			var coverFile string
+			var key string
+			if strings.HasSuffix(file, ".cgo1.go") {
+				// cgo files have absolute paths
+				base := filepath.Base(file)
+				sourceFile = file
+				coverFile = objdir + base
+				key = strings.TrimSuffix(base, ".cgo1.go") + ".go"
+			} else {
+				sourceFile = filepath.Join(a.Package.Dir, file)
+				coverFile = objdir + file
+				key = file
+			}
+			coverFile = strings.TrimSuffix(coverFile, ".go") + ".cover.go"
+			cover := a.Package.Internal.CoverVars[key]
+			if cover == nil || base.IsTestFile(file) {
+				// Not covering this file.
+				continue
+			}
+			if err := b.cover(a, coverFile, sourceFile, 0666, cover.Var); err != nil {
+				return err
+			}
+			if i < len(gofiles) {
+				gofiles[i] = coverFile
+			} else {
+				cgofiles[i-len(gofiles)] = coverFile
+			}
+		}
 	}
 
 	// Run cgo.
@@ -377,7 +479,7 @@ func (b *Builder) build(a *Action) (err error) {
 			sfiles = nil
 		}
 
-		outGo, outObj, err := b.cgo(a, base.Tool("cgo"), objdir, pcCFLAGS, pcLDFLAGS, cgofiles, objdirCgofiles, gccfiles, cxxfiles, a.Package.MFiles, a.Package.FFiles)
+		outGo, outObj, err := b.cgo(a, base.Tool("cgo"), objdir, pcCFLAGS, pcLDFLAGS, mkAbsFiles(a.Package.Dir, cgofiles), gccfiles, cxxfiles, a.Package.MFiles, a.Package.FFiles)
 		if err != nil {
 			return err
 		}
@@ -387,39 +489,13 @@ func (b *Builder) build(a *Action) (err error) {
 		cgoObjects = append(cgoObjects, outObj...)
 		gofiles = append(gofiles, outGo...)
 	}
+	if cached && !a.needVet {
+		return nil
+	}
 
 	// Sanity check only, since Package.load already checked as well.
 	if len(gofiles) == 0 {
 		return &load.NoGoError{Package: a.Package}
-	}
-
-	// If we're doing coverage, preprocess the .go files and put them in the work directory
-	if a.Package.Internal.CoverMode != "" {
-		for i, file := range gofiles {
-			var sourceFile string
-			var coverFile string
-			var key string
-			if strings.HasSuffix(file, ".cgo1.go") {
-				// cgo files have absolute paths
-				base := filepath.Base(file)
-				sourceFile = file
-				coverFile = objdir + base
-				key = strings.TrimSuffix(base, ".cgo1.go") + ".go"
-			} else {
-				sourceFile = filepath.Join(a.Package.Dir, file)
-				coverFile = objdir + file
-				key = file
-			}
-			cover := a.Package.Internal.CoverVars[key]
-			if cover == nil || base.IsTestFile(file) {
-				// Not covering this file.
-				continue
-			}
-			if err := b.cover(a, coverFile, sourceFile, 0666, cover.Var); err != nil {
-				return err
-			}
-			gofiles[i] = coverFile
-		}
 	}
 
 	// Prepare Go vet config if needed.
@@ -429,17 +505,11 @@ func (b *Builder) build(a *Action) (err error) {
 		// so that vet's error messages will use absolute paths,
 		// so that we can reformat them relative to the directory
 		// in which the go command is invoked.
-		absfiles := make([]string, len(gofiles))
-		for i, f := range gofiles {
-			if !filepath.IsAbs(f) {
-				f = filepath.Join(a.Package.Dir, f)
-			}
-			absfiles[i] = f
-		}
 		vcfg = &vetConfig{
 			Compiler:    cfg.BuildToolchainName,
 			Dir:         a.Package.Dir,
-			GoFiles:     absfiles,
+			GoFiles:     mkAbsFiles(a.Package.Dir, gofiles),
+			ImportPath:  a.Package.ImportPath,
 			ImportMap:   make(map[string]string),
 			PackageFile: make(map[string]string),
 		}
@@ -451,24 +521,18 @@ func (b *Builder) build(a *Action) (err error) {
 	}
 
 	// Prepare Go import config.
+	// We start it off with a comment so it can't be empty, so icfg.Bytes() below is never nil.
+	// It should never be empty anyway, but there have been bugs in the past that resulted
+	// in empty configs, which then unfortunately turn into "no config passed to compiler",
+	// and the compiler falls back to looking in pkg itself, which mostly works,
+	// except when it doesn't.
 	var icfg bytes.Buffer
-	for _, a1 := range a.Deps {
-		p1 := a1.Package
-		if p1 == nil || p1.ImportPath == "" {
-			continue
-		}
-		path := p1.ImportPath
-		i := strings.LastIndex(path, "/vendor/")
-		if i >= 0 {
-			i += len("/vendor/")
-		} else if strings.HasPrefix(path, "vendor/") {
-			i = len("vendor/")
-		} else {
-			continue
-		}
-		fmt.Fprintf(&icfg, "importmap %s=%s\n", path[i:], path)
-		if vcfg != nil {
-			vcfg.ImportMap[path[i:]] = path
+	fmt.Fprintf(&icfg, "# import config\n")
+
+	for i, raw := range a.Package.Internal.RawImports {
+		final := a.Package.Imports[i]
+		if final != raw {
+			fmt.Fprintf(&icfg, "importmap %s=%s\n", raw, final)
 		}
 	}
 
@@ -509,7 +573,7 @@ func (b *Builder) build(a *Action) (err error) {
 	objpkg := objdir + "_pkg_.a"
 	ofile, out, err := BuildToolchain.gc(b, a, objpkg, icfg.Bytes(), len(sfiles) > 0, gofiles)
 	if len(out) > 0 {
-		b.showOutput(a.Package.Dir, a.Package.ImportPath, b.processOutput(out))
+		b.showOutput(a, a.Package.Dir, a.Package.ImportPath, b.processOutput(out))
 		if err != nil {
 			return errPrintedOutput
 		}
@@ -565,6 +629,24 @@ func (b *Builder) build(a *Action) (err error) {
 		objects = append(objects, ofiles...)
 	}
 
+	// For gccgo on ELF systems, we write the build ID as an assembler file.
+	// This lets us set the the SHF_EXCLUDE flag.
+	// This is read by readGccgoArchive in cmd/internal/buildid/buildid.go.
+	if a.buildID != "" && cfg.BuildToolchainName == "gccgo" {
+		switch cfg.Goos {
+		case "android", "dragonfly", "freebsd", "linux", "netbsd", "openbsd", "solaris":
+			asmfile, err := b.gccgoBuildIDELFFile(a)
+			if err != nil {
+				return err
+			}
+			ofiles, err := BuildToolchain.asm(b, a, []string{asmfile})
+			if err != nil {
+				return err
+			}
+			objects = append(objects, ofiles...)
+		}
+	}
+
 	// NOTE(rsc): On Windows, it is critically important that the
 	// gcc-compiled objects (cgoObjects) be listed after the ordinary
 	// objects in the archive. I do not know why this is.
@@ -587,10 +669,11 @@ func (b *Builder) build(a *Action) (err error) {
 		}
 	}
 
-	if err := b.updateBuildID(a, objpkg); err != nil {
+	if err := b.updateBuildID(a, objpkg, true); err != nil {
 		return err
 	}
 
+	a.built = objpkg
 	return nil
 }
 
@@ -600,7 +683,14 @@ type vetConfig struct {
 	GoFiles     []string
 	ImportMap   map[string]string
 	PackageFile map[string]string
+	ImportPath  string
+
+	SucceedOnTypecheckFailure bool
 }
+
+// VetTool is the path to an alternate vet tool binary.
+// The caller is expected to set it (if needed) before executing any vet actions.
+var VetTool string
 
 // VetFlags are the flags to pass to vet.
 // The caller is expected to set them before executing any vet actions.
@@ -625,6 +715,13 @@ func (b *Builder) vet(a *Action) error {
 		vcfg.PackageFile["fmt"] = a1.built
 	}
 
+	// During go test, ignore type-checking failures during vet.
+	// We only run vet if the compilation has succeeded,
+	// so at least for now assume the bug is in vet.
+	// We know of at least #18395.
+	// TODO(rsc,gri): Try to remove this for Go 1.11.
+	vcfg.SucceedOnTypecheckFailure = cfg.CmdName == "test"
+
 	js, err := json.MarshalIndent(vcfg, "", "\t")
 	if err != nil {
 		return fmt.Errorf("internal error marshaling vet config: %v", err)
@@ -634,14 +731,23 @@ func (b *Builder) vet(a *Action) error {
 		return err
 	}
 
+	var env []string
+	if cfg.BuildToolchainName == "gccgo" {
+		env = append(env, "GCCGO="+BuildToolchain.compiler())
+	}
+
 	p := a.Package
-	return b.run(p.Dir, p.ImportPath, nil, cfg.BuildToolexec, base.Tool("vet"), VetFlags, a.Objdir+"vet.cfg")
+	tool := VetTool
+	if tool == "" {
+		tool = base.Tool("vet")
+	}
+	return b.run(a, p.Dir, p.ImportPath, env, cfg.BuildToolexec, tool, VetFlags, a.Objdir+"vet.cfg")
 }
 
 // linkActionID computes the action ID for a link action.
 func (b *Builder) linkActionID(a *Action) cache.ActionID {
-	h := cache.NewHash("link")
 	p := a.Package
+	h := cache.NewHash("link " + p.ImportPath)
 
 	// Toolchain-independent configuration.
 	fmt.Fprintf(h, "link\n")
@@ -650,7 +756,7 @@ func (b *Builder) linkActionID(a *Action) cache.ActionID {
 	fmt.Fprintf(h, "omitdebug %v standard %v local %v prefix %q\n", p.Internal.OmitDebug, p.Standard, p.Internal.Local, p.Internal.LocalPrefix)
 
 	// Toolchain-dependent configuration, shared with b.linkSharedActionID.
-	b.printLinkerConfig(h)
+	b.printLinkerConfig(h, p)
 
 	// Input files.
 	for _, a1 := range a.Deps {
@@ -663,8 +769,13 @@ func (b *Builder) linkActionID(a *Action) cache.ActionID {
 				}
 				fmt.Fprintf(h, "packagefile %s=%s\n", p1.ImportPath, contentID(buildID))
 			}
+			// Because we put package main's full action ID into the binary's build ID,
+			// we must also put the full action ID into the binary's action ID hash.
+			if p1.Name == "main" {
+				fmt.Fprintf(h, "packagemain %s\n", a1.buildID)
+			}
 			if p1.Shlib != "" {
-				fmt.Fprintf(h, "pakageshlib %s=%s\n", p1.ImportPath, contentID(b.buildID(p1.Shlib)))
+				fmt.Fprintf(h, "packageshlib %s=%s\n", p1.ImportPath, contentID(b.buildID(p1.Shlib)))
 			}
 		}
 	}
@@ -674,24 +785,20 @@ func (b *Builder) linkActionID(a *Action) cache.ActionID {
 
 // printLinkerConfig prints the linker config into the hash h,
 // as part of the computation of a linker-related action ID.
-func (b *Builder) printLinkerConfig(h io.Writer) {
+func (b *Builder) printLinkerConfig(h io.Writer, p *load.Package) {
 	switch cfg.BuildToolchainName {
 	default:
 		base.Fatalf("linkActionID: unknown toolchain %q", cfg.BuildToolchainName)
 
 	case "gc":
-		fmt.Fprintf(h, "link %s %q %s\n", b.toolID("link"), cfg.BuildLdflags, ldBuildmode)
+		fmt.Fprintf(h, "link %s %q %s\n", b.toolID("link"), forcedLdflags, ldBuildmode)
+		if p != nil {
+			fmt.Fprintf(h, "linkflags %q\n", p.Internal.Ldflags)
+		}
 		fmt.Fprintf(h, "GO$GOARCH=%s\n", os.Getenv("GO"+strings.ToUpper(cfg.BuildContext.GOARCH))) // GO386, GOARM, etc
 
-		/*
-			// TODO(rsc): Enable this code.
-			// golang.org/issue/22475.
-			goroot := cfg.BuildContext.GOROOT
-			if final := os.Getenv("GOROOT_FINAL"); final != "" {
-				goroot = final
-			}
-			fmt.Fprintf(h, "GOROOT=%s\n", goroot)
-		*/
+		// The linker writes source file paths that say GOROOT_FINAL.
+		fmt.Fprintf(h, "GOROOT=%s\n", cfg.GOROOT_FINAL)
 
 		// TODO(rsc): Convince linker team not to add more magic environment variables,
 		// or perhaps restrict the environment variables passed to subprocesses.
@@ -706,6 +813,14 @@ func (b *Builder) printLinkerConfig(h io.Writer) {
 
 		// TODO(rsc): Do cgo settings and flags need to be included?
 		// Or external linker settings and flags?
+
+	case "gccgo":
+		id, err := b.gccgoToolID(BuildToolchain.linker(), "go")
+		if err != nil {
+			base.Fatalf("%v", err)
+		}
+		fmt.Fprintf(h, "link %s %s\n", id, ldBuildmode)
+		// TODO(iant): Should probably include cgo flags here.
 	}
 }
 
@@ -715,6 +830,7 @@ func (b *Builder) link(a *Action) (err error) {
 	if b.useCache(a, a.Package, b.linkActionID(a), a.Package.Target) {
 		return nil
 	}
+	defer b.flushOutput(a)
 
 	if err := b.Mkdir(a.Objdir); err != nil {
 		return err
@@ -733,25 +849,31 @@ func (b *Builder) link(a *Action) (err error) {
 		}
 	}
 
-	objpkg := a.Objdir + "_pkg_.a"
-	if err := BuildToolchain.ld(b, a, a.Target, importcfg, objpkg); err != nil {
+	if err := BuildToolchain.ld(b, a, a.Target, importcfg, a.Deps[0].built); err != nil {
 		return err
 	}
 
 	// Update the binary with the final build ID.
-	// But if OmitDebug is set, don't, because we set OmitDebug
+	// But if OmitDebug is set, don't rewrite the binary, because we set OmitDebug
 	// on binaries that we are going to run and then delete.
 	// There's no point in doing work on such a binary.
 	// Worse, opening the binary for write here makes it
 	// essentially impossible to safely fork+exec due to a fundamental
 	// incompatibility between ETXTBSY and threads on modern Unix systems.
 	// See golang.org/issue/22220.
-	if !a.Package.Internal.OmitDebug {
-		if err := b.updateBuildID(a, a.Target); err != nil {
-			return err
-		}
+	// We still call updateBuildID to update a.buildID, which is important
+	// for test result caching, but passing rewrite=false (final arg)
+	// means we don't actually rewrite the binary, nor store the
+	// result into the cache.
+	// Not calling updateBuildID means we also don't insert these
+	// binaries into the build object cache. That's probably a net win:
+	// less cache space wasted on large binaries we are not likely to
+	// need again. (On the other hand it does make repeated go test slower.)
+	if err := b.updateBuildID(a, a.Target, !a.Package.Internal.OmitDebug); err != nil {
+		return err
 	}
 
+	a.built = a.Target
 	return nil
 }
 
@@ -813,28 +935,43 @@ func splitPkgConfigOutput(out []byte) []string {
 // Calls pkg-config if needed and returns the cflags/ldflags needed to build the package.
 func (b *Builder) getPkgConfigFlags(p *load.Package) (cflags, ldflags []string, err error) {
 	if pkgs := p.CgoPkgConfig; len(pkgs) > 0 {
+		var pcflags []string
+		for len(pkgs) > 0 && strings.HasPrefix(pkgs[0], "--") {
+			pcflags = append(pcflags, pkgs[0])
+			pkgs = pkgs[1:]
+		}
+		for _, pkg := range pkgs {
+			if !load.SafeArg(pkg) {
+				return nil, nil, fmt.Errorf("invalid pkg-config package name: %s", pkg)
+			}
+		}
 		var out []byte
-		out, err = b.runOut(p.Dir, p.ImportPath, nil, b.PkgconfigCmd(), "--cflags", pkgs)
+		out, err = b.runOut(p.Dir, p.ImportPath, nil, b.PkgconfigCmd(), "--cflags", pcflags, "--", pkgs)
 		if err != nil {
-			b.showOutput(p.Dir, b.PkgconfigCmd()+" --cflags "+strings.Join(pkgs, " "), string(out))
+			b.showOutput(nil, p.Dir, b.PkgconfigCmd()+" --cflags "+strings.Join(pcflags, " ")+strings.Join(pkgs, " "), string(out))
 			b.Print(err.Error() + "\n")
-			err = errPrintedOutput
-			return
+			return nil, nil, errPrintedOutput
 		}
 		if len(out) > 0 {
 			cflags = splitPkgConfigOutput(out)
+			if err := checkCompilerFlags("CFLAGS", "pkg-config --cflags", cflags); err != nil {
+				return nil, nil, err
+			}
 		}
-		out, err = b.runOut(p.Dir, p.ImportPath, nil, b.PkgconfigCmd(), "--libs", pkgs)
+		out, err = b.runOut(p.Dir, p.ImportPath, nil, b.PkgconfigCmd(), "--libs", pcflags, "--", pkgs)
 		if err != nil {
-			b.showOutput(p.Dir, b.PkgconfigCmd()+" --libs "+strings.Join(pkgs, " "), string(out))
+			b.showOutput(nil, p.Dir, b.PkgconfigCmd()+" --libs "+strings.Join(pcflags, " ")+strings.Join(pkgs, " "), string(out))
 			b.Print(err.Error() + "\n")
-			err = errPrintedOutput
-			return
+			return nil, nil, errPrintedOutput
 		}
 		if len(out) > 0 {
 			ldflags = strings.Fields(string(out))
+			if err := checkLinkerFlags("LDFLAGS", "pkg-config --libs", ldflags); err != nil {
+				return nil, nil, err
+			}
 		}
 	}
+
 	return
 }
 
@@ -859,7 +996,7 @@ func (b *Builder) linkSharedActionID(a *Action) cache.ActionID {
 	fmt.Fprintf(h, "goos %s goarch %s\n", cfg.Goos, cfg.Goarch)
 
 	// Toolchain-dependent configuration, shared with b.linkActionID.
-	b.printLinkerConfig(h)
+	b.printLinkerConfig(h, nil)
 
 	// Input files.
 	for _, a1 := range a.Deps {
@@ -870,7 +1007,7 @@ func (b *Builder) linkSharedActionID(a *Action) cache.ActionID {
 		if p1 != nil {
 			fmt.Fprintf(h, "packagefile %s=%s\n", p1.ImportPath, contentID(b.buildID(a1.built)))
 			if p1.Shlib != "" {
-				fmt.Fprintf(h, "pakageshlib %s=%s\n", p1.ImportPath, contentID(b.buildID(p1.Shlib)))
+				fmt.Fprintf(h, "packageshlib %s=%s\n", p1.ImportPath, contentID(b.buildID(p1.Shlib)))
 			}
 		}
 	}
@@ -887,6 +1024,7 @@ func (b *Builder) linkShared(a *Action) (err error) {
 	if b.useCache(a, nil, b.linkSharedActionID(a), a.Target) {
 		return nil
 	}
+	defer b.flushOutput(a)
 
 	if err := b.Mkdir(a.Objdir); err != nil {
 		return err
@@ -899,7 +1037,8 @@ func (b *Builder) linkShared(a *Action) (err error) {
 
 	// TODO(rsc): There is a missing updateBuildID here,
 	// but we have to decide where to store the build ID in these files.
-	return BuildToolchain.ldShared(b, a.Deps[0].Deps, a.Target, importcfg, a.Deps)
+	a.built = a.Target
+	return BuildToolchain.ldShared(b, a, a.Deps[0].Deps, a.Target, importcfg, a.Deps)
 }
 
 // BuildInstallFunc is the action for installing a single package or executable.
@@ -913,7 +1052,7 @@ func BuildInstallFunc(b *Builder, a *Action) (err error) {
 			if a.Package != nil {
 				sep, path = " ", a.Package.ImportPath
 			}
-			err = fmt.Errorf("go install%s%s: %v", sep, path, err)
+			err = fmt.Errorf("go %s%s%s: %v", cfg.CmdName, sep, path, err)
 		}
 	}()
 
@@ -928,6 +1067,28 @@ func BuildInstallFunc(b *Builder, a *Action) (err error) {
 	if a1.built == a.Target {
 		a.built = a.Target
 		b.cleanup(a1)
+		// Whether we're smart enough to avoid a complete rebuild
+		// depends on exactly what the staleness and rebuild algorithms
+		// are, as well as potentially the state of the Go build cache.
+		// We don't really want users to be able to infer (or worse start depending on)
+		// those details from whether the modification time changes during
+		// "go install", so do a best-effort update of the file times to make it
+		// look like we rewrote a.Target even if we did not. Updating the mtime
+		// may also help other mtime-based systems that depend on our
+		// previous mtime updates that happened more often.
+		// This is still not perfect - we ignore the error result, and if the file was
+		// unwritable for some reason then pretending to have written it is also
+		// confusing - but it's probably better than not doing the mtime update.
+		//
+		// But don't do that for the special case where building an executable
+		// with -linkshared implicitly installs all its dependent libraries.
+		// We want to hide that awful detail as much as possible, so don't
+		// advertise it by touching the mtimes (usually the libraries are up
+		// to date).
+		if !a.buggyInstall {
+			now := time.Now()
+			os.Chtimes(a.Target, now, now)
+		}
 		return nil
 	}
 	if b.ComputeStaleOnly {
@@ -957,7 +1118,7 @@ func BuildInstallFunc(b *Builder, a *Action) (err error) {
 
 	defer b.cleanup(a1)
 
-	return b.moveOrCopyFile(a, a.Target, a1.Target, perm, false)
+	return b.moveOrCopyFile(a, a.Target, a1.built, perm, false)
 }
 
 // cleanup removes a's object dir to keep the amount of
@@ -982,6 +1143,19 @@ func (b *Builder) moveOrCopyFile(a *Action, dst, src string, perm os.FileMode, f
 
 	// If we can update the mode and rename to the dst, do it.
 	// Otherwise fall back to standard copy.
+
+	// If the source is in the build cache, we need to copy it.
+	if strings.HasPrefix(src, cache.DefaultDir()) {
+		return b.copyFile(a, dst, src, perm, force)
+	}
+
+	// On Windows, always copy the file, so that we respect the NTFS
+	// permissions of the parent folder. https://golang.org/issue/22343.
+	// What matters here is not cfg.Goos (the system we are building
+	// for) but runtime.GOOS (the system we are building on).
+	if runtime.GOOS == "windows" {
+		return b.copyFile(a, dst, src, perm, force)
+	}
 
 	// If the destination directory has the group sticky bit set,
 	// we have to copy the file to retain the correct permissions.
@@ -1097,6 +1271,9 @@ func (b *Builder) installHeader(a *Action) error {
 	if _, err := os.Stat(src); os.IsNotExist(err) {
 		// If the file does not exist, there are no exported
 		// functions, and we do not install anything.
+		// TODO(rsc): Once we know that caching is rebuilding
+		// at the right times (not missing rebuilds), here we should
+		// probably delete the installed header, if any.
 		if cfg.BuildX {
 			b.Showcmd("", "# %s not created", src)
 		}
@@ -1116,7 +1293,7 @@ func (b *Builder) installHeader(a *Action) error {
 // cover runs, in effect,
 //	go tool cover -mode=b.coverMode -var="varName" -o dst.go src.go
 func (b *Builder) cover(a *Action, dst, src string, perm os.FileMode, varName string) error {
-	return b.run(a.Objdir, "cover "+a.Package.ImportPath, nil,
+	return b.run(a, a.Objdir, "cover "+a.Package.ImportPath, nil,
 		cfg.BuildToolexec,
 		base.Tool("cover"),
 		"-mode", a.Package.Internal.CoverMode,
@@ -1221,7 +1398,10 @@ func (b *Builder) Showcmd(dir string, format string, args ...interface{}) {
 //
 // showOutput also replaces references to the work directory with $WORK.
 //
-func (b *Builder) showOutput(dir, desc, out string) {
+// If a is not nil and a.output is not nil, showOutput appends to that slice instead of
+// printing to b.Print.
+//
+func (b *Builder) showOutput(a *Action, dir, desc, out string) {
 	prefix := "# " + desc
 	suffix := "\n" + out
 	if reldir := base.ShortPath(dir); reldir != dir {
@@ -1229,6 +1409,12 @@ func (b *Builder) showOutput(dir, desc, out string) {
 		suffix = strings.Replace(suffix, "\n"+dir, "\n"+reldir, -1)
 	}
 	suffix = strings.Replace(suffix, " "+b.WorkDir, " $WORK", -1)
+
+	if a != nil && a.output != nil {
+		a.output = append(a.output, prefix...)
+		a.output = append(a.output, suffix...)
+		return
+	}
 
 	b.output.Lock()
 	defer b.output.Unlock()
@@ -1242,19 +1428,19 @@ func (b *Builder) showOutput(dir, desc, out string) {
 // print this error.
 var errPrintedOutput = errors.New("already printed output - no need to show error")
 
-var cgoLine = regexp.MustCompile(`\[[^\[\]]+\.cgo1\.go:[0-9]+(:[0-9]+)?\]`)
-var cgoTypeSigRe = regexp.MustCompile(`\b_Ctype_\B`)
+var cgoLine = regexp.MustCompile(`\[[^\[\]]+\.(cgo1|cover)\.go:[0-9]+(:[0-9]+)?\]`)
+var cgoTypeSigRe = regexp.MustCompile(`\b_C2?(type|func|var|macro)_\B`)
 
 // run runs the command given by cmdline in the directory dir.
 // If the command fails, run prints information about the failure
 // and returns a non-nil error.
-func (b *Builder) run(dir string, desc string, env []string, cmdargs ...interface{}) error {
+func (b *Builder) run(a *Action, dir string, desc string, env []string, cmdargs ...interface{}) error {
 	out, err := b.runOut(dir, desc, env, cmdargs...)
 	if len(out) > 0 {
 		if desc == "" {
 			desc = b.fmtcmd(dir, "%s", strings.Join(str.StringList(cmdargs...), " "))
 		}
-		b.showOutput(dir, desc, b.processOutput(out))
+		b.showOutput(a, dir, desc, b.processOutput(out))
 		if err != nil {
 			err = errPrintedOutput
 		}
@@ -1283,6 +1469,17 @@ func (b *Builder) processOutput(out []byte) string {
 // It returns the command output and any errors that occurred.
 func (b *Builder) runOut(dir string, desc string, env []string, cmdargs ...interface{}) ([]byte, error) {
 	cmdline := str.StringList(cmdargs...)
+
+	for _, arg := range cmdline {
+		// GNU binutils commands, including gcc and gccgo, interpret an argument
+		// @foo anywhere in the command line (even following --) as meaning
+		// "read and insert arguments from the file named foo."
+		// Don't say anything that might be misinterpreted that way.
+		if strings.HasPrefix(arg, "@") {
+			return nil, fmt.Errorf("invalid command-line argument %s in command: %s", arg, joinUnambiguously(cmdline))
+		}
+	}
+
 	if cfg.BuildN || cfg.BuildX {
 		var envcmdline string
 		for _, e := range env {
@@ -1413,7 +1610,7 @@ type toolchain interface {
 	// ld runs the linker to create an executable starting at mainpkg.
 	ld(b *Builder, root *Action, out, importcfg, mainpkg string) error
 	// ldShared runs the linker to create a shared library containing the pkgs built by toplevelactions
-	ldShared(b *Builder, toplevelactions []*Action, out, importcfg string, allactions []*Action) error
+	ldShared(b *Builder, root *Action, toplevelactions []*Action, out, importcfg string, allactions []*Action) error
 
 	compiler() string
 	linker() string
@@ -1452,7 +1649,7 @@ func (noToolchain) ld(b *Builder, root *Action, out, importcfg, mainpkg string) 
 	return noCompiler()
 }
 
-func (noToolchain) ldShared(b *Builder, toplevelactions []*Action, out, importcfg string, allactions []*Action) error {
+func (noToolchain) ldShared(b *Builder, root *Action, toplevelactions []*Action, out, importcfg string, allactions []*Action) error {
 	return noCompiler()
 }
 
@@ -1461,22 +1658,22 @@ func (noToolchain) cc(b *Builder, a *Action, ofile, cfile string) error {
 }
 
 // gcc runs the gcc C compiler to create an object from a single C file.
-func (b *Builder) gcc(p *load.Package, workdir, out string, flags []string, cfile string) error {
-	return b.ccompile(p, out, flags, cfile, b.GccCmd(p.Dir, workdir))
+func (b *Builder) gcc(a *Action, p *load.Package, workdir, out string, flags []string, cfile string) error {
+	return b.ccompile(a, p, out, flags, cfile, b.GccCmd(p.Dir, workdir))
 }
 
 // gxx runs the g++ C++ compiler to create an object from a single C++ file.
-func (b *Builder) gxx(p *load.Package, workdir, out string, flags []string, cxxfile string) error {
-	return b.ccompile(p, out, flags, cxxfile, b.GxxCmd(p.Dir, workdir))
+func (b *Builder) gxx(a *Action, p *load.Package, workdir, out string, flags []string, cxxfile string) error {
+	return b.ccompile(a, p, out, flags, cxxfile, b.GxxCmd(p.Dir, workdir))
 }
 
 // gfortran runs the gfortran Fortran compiler to create an object from a single Fortran file.
-func (b *Builder) gfortran(p *load.Package, workdir, out string, flags []string, ffile string) error {
-	return b.ccompile(p, out, flags, ffile, b.gfortranCmd(p.Dir, workdir))
+func (b *Builder) gfortran(a *Action, p *load.Package, workdir, out string, flags []string, ffile string) error {
+	return b.ccompile(a, p, out, flags, ffile, b.gfortranCmd(p.Dir, workdir))
 }
 
 // ccompile runs the given C or C++ compiler and creates an object from a single source file.
-func (b *Builder) ccompile(p *load.Package, outfile string, flags []string, file string, compiler []string) error {
+func (b *Builder) ccompile(a *Action, p *load.Package, outfile string, flags []string, file string, compiler []string) error {
 	file = mkAbs(p.Dir, file)
 	desc := p.ImportPath
 	if !filepath.IsAbs(outfile) {
@@ -1500,11 +1697,11 @@ func (b *Builder) ccompile(p *load.Package, outfile string, flags []string, file
 				}
 			}
 			if len(newFlags) < len(flags) {
-				return b.ccompile(p, outfile, newFlags, file, compiler)
+				return b.ccompile(a, p, outfile, newFlags, file, compiler)
 			}
 		}
 
-		b.showOutput(p.Dir, desc, b.processOutput(output))
+		b.showOutput(a, p.Dir, desc, b.processOutput(output))
 		if err != nil {
 			err = errPrintedOutput
 		} else if os.Getenv("GO_BUILDER_NAME") != "" {
@@ -1522,7 +1719,7 @@ func (b *Builder) gccld(p *load.Package, objdir, out string, flags []string, obj
 	} else {
 		cmd = b.GccCmd(p.Dir, objdir)
 	}
-	return b.run(p.Dir, p.ImportPath, nil, cmd, "-o", out, objs, flags)
+	return b.run(nil, p.Dir, p.ImportPath, nil, cmd, "-o", out, objs, flags)
 }
 
 // Grab these before main helpfully overwrites them.
@@ -1550,12 +1747,12 @@ func (b *Builder) gfortranCmd(incdir, workdir string) []string {
 
 // ccExe returns the CC compiler setting without all the extra flags we add implicitly.
 func (b *Builder) ccExe() []string {
-	return b.compilerExe(origCC, cfg.DefaultCC)
+	return b.compilerExe(origCC, cfg.DefaultCC(cfg.Goos, cfg.Goarch))
 }
 
 // cxxExe returns the CXX compiler setting without all the extra flags we add implicitly.
 func (b *Builder) cxxExe() []string {
-	return b.compilerExe(origCXX, cfg.DefaultCXX)
+	return b.compilerExe(origCXX, cfg.DefaultCXX(cfg.Goos, cfg.Goarch))
 }
 
 // fcExe returns the FC compiler setting without all the extra flags we add implicitly.
@@ -1663,21 +1860,17 @@ func (b *Builder) gccSupportsFlag(compiler []string, flag string) bool {
 		return b
 	}
 	if b.flagCache == nil {
-		if cfg.BuildN || cfg.BuildX {
-			b.Showcmd(b.WorkDir, "touch trivial.c")
-		}
-		if !cfg.BuildN {
-			src := filepath.Join(b.WorkDir, "trivial.c")
-			if err := ioutil.WriteFile(src, []byte{}, 0666); err != nil {
-				return false
-			}
-		}
 		b.flagCache = make(map[[2]string]bool)
 	}
-	cmdArgs := append([]string(nil), compiler...)
-	cmdArgs = append(cmdArgs, flag, "-c", "trivial.c")
+	// We used to write an empty C file, but that gets complicated with
+	// go build -n. We tried using a file that does not exist, but that
+	// fails on systems with GCC version 4.2.1; that is the last GPLv2
+	// version of GCC, so some systems have frozen on it.
+	// Now we pass an empty file on stdin, which should work at least for
+	// GCC and clang.
+	cmdArgs := str.StringList(compiler, flag, "-c", "-x", "c", "-")
 	if cfg.BuildN || cfg.BuildX {
-		b.Showcmd(b.WorkDir, "%s", joinUnambiguously(cmdArgs))
+		b.Showcmd(b.WorkDir, "%s || true", joinUnambiguously(cmdArgs))
 		if cfg.BuildN {
 			return false
 		}
@@ -1685,10 +1878,15 @@ func (b *Builder) gccSupportsFlag(compiler []string, flag string) bool {
 	cmd := exec.Command(cmdArgs[0], cmdArgs[1:]...)
 	cmd.Dir = b.WorkDir
 	cmd.Env = base.MergeEnvLists([]string{"LC_ALL=C"}, base.EnvForDir(cmd.Dir, os.Environ()))
-	out, err := cmd.CombinedOutput()
+	out, _ := cmd.CombinedOutput()
 	// GCC says "unrecognized command line option".
 	// clang says "unknown argument".
-	supported := err == nil && !bytes.Contains(out, []byte("unrecognized")) && !bytes.Contains(out, []byte("unknown"))
+	// Older versions of GCC say "unrecognised debug output level".
+	// For -fsplit-stack GCC says "'-fsplit-stack' is not supported".
+	supported := !bytes.Contains(out, []byte("unrecognized")) &&
+		!bytes.Contains(out, []byte("unknown")) &&
+		!bytes.Contains(out, []byte("unrecognised")) &&
+		!bytes.Contains(out, []byte("is not supported"))
 	b.flagCache[key] = supported
 	return supported
 }
@@ -1723,22 +1921,44 @@ func envList(key, def string) []string {
 }
 
 // CFlags returns the flags to use when invoking the C, C++ or Fortran compilers, or cgo.
-func (b *Builder) CFlags(p *load.Package) (cppflags, cflags, cxxflags, fflags, ldflags []string) {
+func (b *Builder) CFlags(p *load.Package) (cppflags, cflags, cxxflags, fflags, ldflags []string, err error) {
 	defaults := "-g -O2"
 
-	cppflags = str.StringList(envList("CGO_CPPFLAGS", ""), p.CgoCPPFLAGS)
-	cflags = str.StringList(envList("CGO_CFLAGS", defaults), p.CgoCFLAGS)
-	cxxflags = str.StringList(envList("CGO_CXXFLAGS", defaults), p.CgoCXXFLAGS)
-	fflags = str.StringList(envList("CGO_FFLAGS", defaults), p.CgoFFLAGS)
-	ldflags = str.StringList(envList("CGO_LDFLAGS", defaults), p.CgoLDFLAGS)
+	if cppflags, err = buildFlags("CPPFLAGS", "", p.CgoCPPFLAGS, checkCompilerFlags); err != nil {
+		return
+	}
+	if cflags, err = buildFlags("CFLAGS", defaults, p.CgoCFLAGS, checkCompilerFlags); err != nil {
+		return
+	}
+	if cxxflags, err = buildFlags("CXXFLAGS", defaults, p.CgoCXXFLAGS, checkCompilerFlags); err != nil {
+		return
+	}
+	if fflags, err = buildFlags("FFLAGS", defaults, p.CgoFFLAGS, checkCompilerFlags); err != nil {
+		return
+	}
+	if ldflags, err = buildFlags("LDFLAGS", defaults, p.CgoLDFLAGS, checkLinkerFlags); err != nil {
+		return
+	}
+
 	return
+}
+
+func buildFlags(name, defaults string, fromPackage []string, check func(string, string, []string) error) ([]string, error) {
+	if err := check(name, "#cgo "+name, fromPackage); err != nil {
+		return nil, err
+	}
+	return str.StringList(envList("CGO_"+name, defaults), fromPackage), nil
 }
 
 var cgoRe = regexp.MustCompile(`[/\\:]`)
 
-func (b *Builder) cgo(a *Action, cgoExe, objdir string, pcCFLAGS, pcLDFLAGS, cgofiles, objdirCgofiles, gccfiles, gxxfiles, mfiles, ffiles []string) (outGo, outObj []string, err error) {
+func (b *Builder) cgo(a *Action, cgoExe, objdir string, pcCFLAGS, pcLDFLAGS, cgofiles, gccfiles, gxxfiles, mfiles, ffiles []string) (outGo, outObj []string, err error) {
 	p := a.Package
-	cgoCPPFLAGS, cgoCFLAGS, cgoCXXFLAGS, cgoFFLAGS, cgoLDFLAGS := b.CFlags(p)
+	cgoCPPFLAGS, cgoCFLAGS, cgoCXXFLAGS, cgoFFLAGS, cgoLDFLAGS, err := b.CFlags(p)
+	if err != nil {
+		return nil, nil, err
+	}
+
 	cgoCPPFLAGS = append(cgoCPPFLAGS, pcCFLAGS...)
 	cgoLDFLAGS = append(cgoLDFLAGS, pcLDFLAGS...)
 	// If we are compiling Objective-C code, then we need to link against libobjc
@@ -1767,28 +1987,14 @@ func (b *Builder) cgo(a *Action, cgoExe, objdir string, pcCFLAGS, pcLDFLAGS, cgo
 	// Allows including _cgo_export.h from .[ch] files in the package.
 	cgoCPPFLAGS = append(cgoCPPFLAGS, "-I", objdir)
 
-	// If we have cgo files in the object directory, then copy any
-	// other cgo files into the object directory, and pass a
-	// -srcdir option to cgo.
-	var srcdirarg []string
-	if len(objdirCgofiles) > 0 {
-		for _, fn := range cgofiles {
-			if err := b.copyFile(a, objdir+filepath.Base(fn), filepath.Join(p.Dir, fn), 0666, false); err != nil {
-				return nil, nil, err
-			}
-		}
-		cgofiles = append(cgofiles, objdirCgofiles...)
-		srcdirarg = []string{"-srcdir", objdir}
-	}
-
 	// cgo
 	// TODO: CGO_FLAGS?
 	gofiles := []string{objdir + "_cgo_gotypes.go"}
 	cfiles := []string{"_cgo_export.c"}
 	for _, fn := range cgofiles {
-		f := cgoRe.ReplaceAllString(fn[:len(fn)-2], "_")
-		gofiles = append(gofiles, objdir+f+"cgo1.go")
-		cfiles = append(cfiles, f+"cgo2.c")
+		f := strings.TrimSuffix(filepath.Base(fn), ".go")
+		gofiles = append(gofiles, objdir+f+".cgo1.go")
+		cfiles = append(cfiles, f+".cgo2.c")
 	}
 
 	// TODO: make cgo not depend on $GOARCH?
@@ -1802,6 +2008,12 @@ func (b *Builder) cgo(a *Action, cgoExe, objdir string, pcCFLAGS, pcLDFLAGS, cgo
 	}
 
 	// Update $CGO_LDFLAGS with p.CgoLDFLAGS.
+	// These flags are recorded in the generated _cgo_gotypes.go file
+	// using //go:cgo_ldflag directives, the compiler records them in the
+	// object file for the package, and then the Go linker passes them
+	// along to the host linker. At this point in the code, cgoLDFLAGS
+	// consists of the original $CGO_LDFLAGS (unchecked) and all the
+	// flags put together from source code (checked).
 	var cgoenv []string
 	if len(cgoLDFLAGS) > 0 {
 		flags := make([]string, len(cgoLDFLAGS))
@@ -1830,7 +2042,7 @@ func (b *Builder) cgo(a *Action, cgoExe, objdir string, pcCFLAGS, pcLDFLAGS, cgo
 		cgoflags = append(cgoflags, "-exportheader="+objdir+"_cgo_install.h")
 	}
 
-	if err := b.run(p.Dir, p.ImportPath, cgoenv, cfg.BuildToolexec, cgoExe, srcdirarg, "-objdir", objdir, "-importpath", p.ImportPath, cgoflags, "--", cgoCPPFLAGS, cgoCFLAGS, cgofiles); err != nil {
+	if err := b.run(a, p.Dir, p.ImportPath, cgoenv, cfg.BuildToolexec, cgoExe, "-objdir", objdir, "-importpath", p.ImportPath, cgoflags, "--", cgoCPPFLAGS, cgoCFLAGS, cgofiles); err != nil {
 		return nil, nil, err
 	}
 	outGo = append(outGo, gofiles...)
@@ -1851,7 +2063,7 @@ func (b *Builder) cgo(a *Action, cgoExe, objdir string, pcCFLAGS, pcLDFLAGS, cgo
 	cflags := str.StringList(cgoCPPFLAGS, cgoCFLAGS)
 	for _, cfile := range cfiles {
 		ofile := nextOfile()
-		if err := b.gcc(p, a.Objdir, ofile, cflags, objdir+cfile); err != nil {
+		if err := b.gcc(a, p, a.Objdir, ofile, cflags, objdir+cfile); err != nil {
 			return nil, nil, err
 		}
 		outObj = append(outObj, ofile)
@@ -1859,7 +2071,7 @@ func (b *Builder) cgo(a *Action, cgoExe, objdir string, pcCFLAGS, pcLDFLAGS, cgo
 
 	for _, file := range gccfiles {
 		ofile := nextOfile()
-		if err := b.gcc(p, a.Objdir, ofile, cflags, file); err != nil {
+		if err := b.gcc(a, p, a.Objdir, ofile, cflags, file); err != nil {
 			return nil, nil, err
 		}
 		outObj = append(outObj, ofile)
@@ -1868,7 +2080,7 @@ func (b *Builder) cgo(a *Action, cgoExe, objdir string, pcCFLAGS, pcLDFLAGS, cgo
 	cxxflags := str.StringList(cgoCPPFLAGS, cgoCXXFLAGS)
 	for _, file := range gxxfiles {
 		ofile := nextOfile()
-		if err := b.gxx(p, a.Objdir, ofile, cxxflags, file); err != nil {
+		if err := b.gxx(a, p, a.Objdir, ofile, cxxflags, file); err != nil {
 			return nil, nil, err
 		}
 		outObj = append(outObj, ofile)
@@ -1876,7 +2088,7 @@ func (b *Builder) cgo(a *Action, cgoExe, objdir string, pcCFLAGS, pcLDFLAGS, cgo
 
 	for _, file := range mfiles {
 		ofile := nextOfile()
-		if err := b.gcc(p, a.Objdir, ofile, cflags, file); err != nil {
+		if err := b.gcc(a, p, a.Objdir, ofile, cflags, file); err != nil {
 			return nil, nil, err
 		}
 		outObj = append(outObj, ofile)
@@ -1885,7 +2097,7 @@ func (b *Builder) cgo(a *Action, cgoExe, objdir string, pcCFLAGS, pcLDFLAGS, cgo
 	fflags := str.StringList(cgoCPPFLAGS, cgoFFLAGS)
 	for _, file := range ffiles {
 		ofile := nextOfile()
-		if err := b.gfortran(p, a.Objdir, ofile, fflags, file); err != nil {
+		if err := b.gfortran(a, p, a.Objdir, ofile, fflags, file); err != nil {
 			return nil, nil, err
 		}
 		outObj = append(outObj, ofile)
@@ -1894,7 +2106,7 @@ func (b *Builder) cgo(a *Action, cgoExe, objdir string, pcCFLAGS, pcLDFLAGS, cgo
 	switch cfg.BuildToolchainName {
 	case "gc":
 		importGo := objdir + "_cgo_import.go"
-		if err := b.dynimport(p, objdir, importGo, cgoExe, cflags, cgoLDFLAGS, outObj); err != nil {
+		if err := b.dynimport(a, p, objdir, importGo, cgoExe, cflags, cgoLDFLAGS, outObj); err != nil {
 			return nil, nil, err
 		}
 		outGo = append(outGo, importGo)
@@ -1917,10 +2129,10 @@ func (b *Builder) cgo(a *Action, cgoExe, objdir string, pcCFLAGS, pcLDFLAGS, cgo
 // dynimport creates a Go source file named importGo containing
 // //go:cgo_import_dynamic directives for each symbol or library
 // dynamically imported by the object files outObj.
-func (b *Builder) dynimport(p *load.Package, objdir, importGo, cgoExe string, cflags, cgoLDFLAGS, outObj []string) error {
+func (b *Builder) dynimport(a *Action, p *load.Package, objdir, importGo, cgoExe string, cflags, cgoLDFLAGS, outObj []string) error {
 	cfile := objdir + "_cgo_main.c"
 	ofile := objdir + "_cgo_main.o"
-	if err := b.gcc(p, objdir, ofile, cflags, cfile); err != nil {
+	if err := b.gcc(a, p, objdir, ofile, cflags, cfile); err != nil {
 		return err
 	}
 
@@ -1941,13 +2153,13 @@ func (b *Builder) dynimport(p *load.Package, objdir, importGo, cgoExe string, cf
 	if p.Standard && p.ImportPath == "runtime/cgo" {
 		cgoflags = []string{"-dynlinker"} // record path to dynamic linker
 	}
-	return b.run(p.Dir, p.ImportPath, nil, cfg.BuildToolexec, cgoExe, "-dynpackage", p.Name, "-dynimport", dynobj, "-dynout", importGo, cgoflags)
+	return b.run(a, p.Dir, p.ImportPath, nil, cfg.BuildToolexec, cgoExe, "-dynpackage", p.Name, "-dynimport", dynobj, "-dynout", importGo, cgoflags)
 }
 
 // Run SWIG on all SWIG input files.
 // TODO: Don't build a shared library, once SWIG emits the necessary
 // pragmas for external linking.
-func (b *Builder) swig(p *load.Package, objdir string, pcCFLAGS []string) (outGo, outC, outCXX []string, err error) {
+func (b *Builder) swig(a *Action, p *load.Package, objdir string, pcCFLAGS []string) (outGo, outC, outCXX []string, err error) {
 	if err := b.swigVersionCheck(); err != nil {
 		return nil, nil, nil, err
 	}
@@ -1958,7 +2170,7 @@ func (b *Builder) swig(p *load.Package, objdir string, pcCFLAGS []string) (outGo
 	}
 
 	for _, f := range p.SwigFiles {
-		goFile, cFile, err := b.swigOne(p, f, objdir, pcCFLAGS, false, intgosize)
+		goFile, cFile, err := b.swigOne(a, p, f, objdir, pcCFLAGS, false, intgosize)
 		if err != nil {
 			return nil, nil, nil, err
 		}
@@ -1970,7 +2182,7 @@ func (b *Builder) swig(p *load.Package, objdir string, pcCFLAGS []string) (outGo
 		}
 	}
 	for _, f := range p.SwigCXXFiles {
-		goFile, cxxFile, err := b.swigOne(p, f, objdir, pcCFLAGS, true, intgosize)
+		goFile, cxxFile, err := b.swigOne(a, p, f, objdir, pcCFLAGS, true, intgosize)
 		if err != nil {
 			return nil, nil, nil, err
 		}
@@ -2093,8 +2305,12 @@ func (b *Builder) swigIntSize(objdir string) (intsize string, err error) {
 }
 
 // Run SWIG on one SWIG input file.
-func (b *Builder) swigOne(p *load.Package, file, objdir string, pcCFLAGS []string, cxx bool, intgosize string) (outGo, outC string, err error) {
-	cgoCPPFLAGS, cgoCFLAGS, cgoCXXFLAGS, _, _ := b.CFlags(p)
+func (b *Builder) swigOne(a *Action, p *load.Package, file, objdir string, pcCFLAGS []string, cxx bool, intgosize string) (outGo, outC string, err error) {
+	cgoCPPFLAGS, cgoCFLAGS, cgoCXXFLAGS, _, _, err := b.CFlags(p)
+	if err != nil {
+		return "", "", err
+	}
+
 	var cflags []string
 	if cxx {
 		cflags = str.StringList(cgoCPPFLAGS, pcCFLAGS, cgoCXXFLAGS)
@@ -2148,16 +2364,29 @@ func (b *Builder) swigOne(p *load.Package, file, objdir string, pcCFLAGS []strin
 			if bytes.Contains(out, []byte("-intgosize")) || bytes.Contains(out, []byte("-cgo")) {
 				return "", "", errors.New("must have SWIG version >= 3.0.6")
 			}
-			b.showOutput(p.Dir, p.ImportPath, b.processOutput(out)) // swig error
+			b.showOutput(a, p.Dir, p.ImportPath, b.processOutput(out)) // swig error
 			return "", "", errPrintedOutput
 		}
 		return "", "", err
 	}
 	if len(out) > 0 {
-		b.showOutput(p.Dir, p.ImportPath, b.processOutput(out)) // swig warning
+		b.showOutput(a, p.Dir, p.ImportPath, b.processOutput(out)) // swig warning
 	}
 
-	return goFile, objdir + gccBase + gccExt, nil
+	// If the input was x.swig, the output is x.go in the objdir.
+	// But there might be an x.go in the original dir too, and if it
+	// uses cgo as well, cgo will be processing both and will
+	// translate both into x.cgo1.go in the objdir, overwriting one.
+	// Rename x.go to _x_swig.go to avoid this problem.
+	// We ignore files in the original dir that begin with underscore
+	// so _x_swig.go cannot conflict with an original file we were
+	// going to compile.
+	goFile = objdir + goFile
+	newGoFile := objdir + "_" + base + "_swig.go"
+	if err := os.Rename(goFile, newGoFile); err != nil {
+		return "", "", err
+	}
+	return newGoFile, objdir + gccBase + gccExt, nil
 }
 
 // disableBuildID adjusts a linker command line to avoid creating a
@@ -2176,4 +2405,18 @@ func (b *Builder) disableBuildID(ldflags []string) []string {
 		ldflags = append(ldflags, "-Wl,--build-id=none")
 	}
 	return ldflags
+}
+
+// mkAbsFiles converts files into a list of absolute files,
+// assuming they were originally relative to dir,
+// and returns that new list.
+func mkAbsFiles(dir string, files []string) []string {
+	abs := make([]string, len(files))
+	for i, f := range files {
+		if !filepath.IsAbs(f) {
+			f = filepath.Join(dir, f)
+		}
+		abs[i] = f
+	}
+	return abs
 }

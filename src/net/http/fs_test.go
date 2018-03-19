@@ -948,8 +948,7 @@ func TestServeContent(t *testing.T) {
 			reqHeader: map[string]string{
 				"If-Match": `"B"`,
 			},
-			wantStatus:      412,
-			wantContentType: "text/plain; charset=utf-8",
+			wantStatus: 412,
 		},
 		"ifmatch_fails_on_weak_etag": {
 			file:      "testdata/style.css",
@@ -957,8 +956,7 @@ func TestServeContent(t *testing.T) {
 			reqHeader: map[string]string{
 				"If-Match": `W/"A"`,
 			},
-			wantStatus:      412,
-			wantContentType: "text/plain; charset=utf-8",
+			wantStatus: 412,
 		},
 		"if_unmodified_since_true": {
 			file:    "testdata/style.css",
@@ -976,9 +974,8 @@ func TestServeContent(t *testing.T) {
 			reqHeader: map[string]string{
 				"If-Unmodified-Since": htmlModTime.Add(-2 * time.Second).UTC().Format(TimeFormat),
 			},
-			wantStatus:      412,
-			wantContentType: "text/plain; charset=utf-8",
-			wantLastMod:     htmlModTime.UTC().Format(TimeFormat),
+			wantStatus:  412,
+			wantLastMod: htmlModTime.UTC().Format(TimeFormat),
 		},
 	}
 	for testName, tt := range tests {
@@ -1143,7 +1140,7 @@ func TestLinuxSendfile(t *testing.T) {
 	Post(fmt.Sprintf("http://%s/quit", ln.Addr()), "", nil)
 	child.Wait()
 
-	rx := regexp.MustCompile(`sendfile(64)?\(\d+,\s*\d+,\s*NULL,\s*\d+`)
+	rx := regexp.MustCompile(`sendfile(64)?\(`)
 	out := buf.String()
 	if !rx.MatchString(out) {
 		t.Errorf("no sendfile system call found in:\n%s", out)

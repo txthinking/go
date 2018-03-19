@@ -164,7 +164,7 @@ TEXT runtime·walltime(SB), NOSPLIT, $32
 // void nanotime(int64 *nsec)
 TEXT runtime·nanotime(SB),NOSPLIT,$32
 	LEAL	12(SP), BX
-	MOVL	$0, 4(SP)		// arg 1 - clock_id
+	MOVL	$3, 4(SP)		// arg 1 - clock_id CLOCK_MONOTONIC
 	MOVL	BX, 8(SP)		// arg 2 - tp
 	MOVL	$427, AX		// sys_clock_gettime
 	INT	$0x80
@@ -346,9 +346,9 @@ TEXT runtime·osyield(SB),NOSPLIT,$-4
 	RET
 
 TEXT runtime·lwp_park(SB),NOSPLIT,$-4
-	MOVL	$434, AX		// sys__lwp_park
+	MOVL	$478, AX		// sys__lwp_park
 	INT	$0x80
-	MOVL	AX, ret+16(FP)
+	MOVL	AX, ret+24(FP)
 	RET
 
 TEXT runtime·lwp_unpark(SB),NOSPLIT,$-4
@@ -375,10 +375,12 @@ TEXT runtime·sysctl(SB),NOSPLIT,$28
 	MOVSL				// arg 6 - newlen
 	MOVL	$202, AX		// sys___sysctl
 	INT	$0x80
-	JCC	3(PC)
+	JAE	4(PC)
 	NEGL	AX
+	MOVL	AX, ret+24(FP)
 	RET
 	MOVL	$0, AX
+	MOVL	AX, ret+24(FP)
 	RET
 
 GLOBL runtime·tlsoffset(SB),NOPTR,$4

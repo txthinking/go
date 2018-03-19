@@ -395,11 +395,11 @@ func ordercall(n *Node, order *Order) {
 			// by copying it into a temp and marking that temp
 			// still alive when we pop the temp stack.
 			xp := n.List.Addr(i)
-			for (*xp).Op == OCONVNOP && !(*xp).Type.IsPtr() {
+			for (*xp).Op == OCONVNOP && !(*xp).Type.IsUnsafePtr() {
 				xp = &(*xp).Left
 			}
 			x := *xp
-			if x.Type.IsPtr() {
+			if x.Type.IsUnsafePtr() {
 				x = ordercopyexpr(x, x.Type, order, 0)
 				x.Name.SetKeepalive(true)
 				*xp = x
@@ -427,10 +427,10 @@ func ordercall(n *Node, order *Order) {
 // to make sure that all map assignments have the form m[k] = x.
 // (Note: orderexpr has already been called on n, so we know k is addressable.)
 //
-// If n is the multiple assignment form ..., m[k], ... = ..., the rewrite is
+// If n is the multiple assignment form ..., m[k], ... = ..., x, ..., the rewrite is
 //	t1 = m
 //	t2 = k
-//	...., t3, ... = x
+//	...., t3, ... = ..., x, ...
 //	t1[t2] = t3
 //
 // The temporaries t1, t2 are needed in case the ... being assigned
@@ -444,6 +444,11 @@ func ordermapassign(n *Node, order *Order) {
 		Fatalf("ordermapassign %v", n.Op)
 
 	case OAS:
+		if n.Left.Op == OINDEXMAP {
+			// Make sure we evaluate the RHS before starting the map insert.
+			// We need to make sure the RHS won't panic.  See issue 22881.
+			n.Right = ordercheapexpr(n.Right, order)
+		}
 		order.out = append(order.out, n)
 
 	case OAS2, OAS2DOTTYPE, OAS2MAPR, OAS2FUNC:

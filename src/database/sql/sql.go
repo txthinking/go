@@ -431,7 +431,7 @@ func (dc *driverConn) resetSession(ctx context.Context) {
 	if dc.closed {    // Check if the database has been closed.
 		return
 	}
-	dc.lastErr = dc.ci.(driver.ResetSessioner).ResetSession(ctx)
+	dc.lastErr = dc.ci.(driver.SessionResetter).ResetSession(ctx)
 }
 
 // the dc.db's Mutex is held.
@@ -660,6 +660,14 @@ func Open(driverName, dataSourceName string) (*DB, error) {
 	driversMu.RUnlock()
 	if !ok {
 		return nil, fmt.Errorf("sql: unknown driver %q (forgotten import?)", driverName)
+	}
+
+	if driverCtx, ok := driveri.(driver.DriverContext); ok {
+		connector, err := driverCtx.OpenConnector(dataSourceName)
+		if err != nil {
+			return nil, err
+		}
+		return OpenDB(connector), nil
 	}
 
 	return OpenDB(dsnConnector{dsn: dataSourceName, driver: driveri}), nil
@@ -939,6 +947,7 @@ func (db *DB) connectionResetter(ctx context.Context) {
 	for {
 		select {
 		case <-ctx.Done():
+			close(db.resetterCh)
 			for dc := range db.resetterCh {
 				dc.Unlock()
 			}
@@ -1171,8 +1180,13 @@ func (db *DB) putConn(dc *driverConn, err error, resetSession bool) {
 	if putConnHook != nil {
 		putConnHook(db, dc)
 	}
+	if db.closed {
+		// Connections do not need to be reset if they will be closed.
+		// Prevents writing to resetterCh after the DB has closed.
+		resetSession = false
+	}
 	if resetSession {
-		if _, resetSession = dc.ci.(driver.ResetSessioner); resetSession {
+		if _, resetSession = dc.ci.(driver.SessionResetter); resetSession {
 			// Lock the driverConn here so it isn't released until
 			// the connection is reset.
 			// The lock must be taken before the connection is put into
@@ -1899,13 +1913,19 @@ func (tx *Tx) closePrepared() {
 
 // Commit commits the transaction.
 func (tx *Tx) Commit() error {
-	if !atomic.CompareAndSwapInt32(&tx.done, 0, 1) {
-		return ErrTxDone
-	}
+	// Check context first to avoid transaction leak.
+	// If put it behind tx.done CompareAndSwap statement, we cant't ensure
+	// the consistency between tx.done and the real COMMIT operation.
 	select {
 	default:
 	case <-tx.ctx.Done():
+		if atomic.LoadInt32(&tx.done) == 1 {
+			return ErrTxDone
+		}
 		return tx.ctx.Err()
+	}
+	if !atomic.CompareAndSwapInt32(&tx.done, 0, 1) {
+		return ErrTxDone
 	}
 	var err error
 	withLock(tx.dc, func() {
@@ -2035,14 +2055,14 @@ func (tx *Tx) StmtContext(ctx context.Context, stmt *Stmt) *Stmt {
 		stmt.mu.Unlock()
 
 		if si == nil {
+			var ds *driverStmt
 			withLock(dc, func() {
-				var ds *driverStmt
 				ds, err = stmt.prepareOnConnLocked(ctx, dc)
-				si = ds.si
 			})
 			if err != nil {
 				return &Stmt{stickyErr: err}
 			}
+			si = ds.si
 		}
 		parentStmt = stmt
 	}
@@ -2242,6 +2262,13 @@ func resultFromStatement(ctx context.Context, ci driver.Conn, ds *driverStmt, ar
 		return nil, err
 	}
 
+	// -1 means the driver doesn't know how to count the number of
+	// placeholders, so we won't sanity check input here and instead let the
+	// driver deal with errors.
+	if want := ds.si.NumInput(); want >= 0 && want != len(dargs) {
+		return nil, fmt.Errorf("sql: statement expects %d inputs; got %d", want, len(dargs))
+	}
+
 	resi, err := ctxDriverStmtExec(ctx, ds.si, dargs)
 	if err != nil {
 		return nil, err
@@ -2408,18 +2435,16 @@ func rowsiFromStatement(ctx context.Context, ci driver.Conn, ds *driverStmt, arg
 	ds.Lock()
 	defer ds.Unlock()
 
-	want := ds.si.NumInput()
+	dargs, err := driverArgsConnLocked(ci, ds, args)
+	if err != nil {
+		return nil, err
+	}
 
 	// -1 means the driver doesn't know how to count the number of
 	// placeholders, so we won't sanity check input here and instead let the
 	// driver deal with errors.
-	if want != -1 && len(args) != want {
-		return nil, fmt.Errorf("sql: statement expects %d inputs; got %d", want, len(args))
-	}
-
-	dargs, err := driverArgsConnLocked(ci, ds, args)
-	if err != nil {
-		return nil, err
+	if want := ds.si.NumInput(); want >= 0 && want != len(dargs) {
+		return nil, fmt.Errorf("sql: statement expects %d inputs; got %d", want, len(dargs))
 	}
 
 	rowsi, err := ctxDriverStmtQuery(ctx, ds.si, dargs)

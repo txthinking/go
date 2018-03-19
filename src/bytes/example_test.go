@@ -155,7 +155,7 @@ func ExampleCount() {
 
 func ExampleEqual() {
 	fmt.Println(bytes.Equal([]byte("Go"), []byte("Go")))
-	fmt.Println(bytes.Equal([]byte("Go"), []byte("go")))
+	fmt.Println(bytes.Equal([]byte("Go"), []byte("C++")))
 	// Output:
 	// true
 	// false
@@ -383,9 +383,9 @@ func ExampleMap() {
 }
 
 func ExampleTrimLeft() {
-	fmt.Print(string(bytes.TrimLeft([]byte("+ 005400"), "+0 ")))
+	fmt.Print(string(bytes.TrimLeft([]byte("453gopher8257"), "0123456789")))
 	// Output:
-	// 5400
+	// gopher8257
 }
 
 func ExampleTrimLeftFunc() {
@@ -430,11 +430,9 @@ func ExampleToLower() {
 }
 
 func ExampleReader_Len() {
-	fmt.Println(bytes.NewReader([]byte("")).Len())
 	fmt.Println(bytes.NewReader([]byte("Hi!")).Len())
-	fmt.Println(bytes.NewReader([]byte("Hello Gopher!")).Len())
+	fmt.Println(bytes.NewReader([]byte("こんにちは!")).Len())
 	// Output:
-	// 0
 	// 3
-	// 13
+	// 16
 }

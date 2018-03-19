@@ -54,6 +54,7 @@ type file struct {
 
 // Fd returns the integer Unix file descriptor referencing the open file.
 // The file descriptor is valid only until f.Close is called or f is garbage collected.
+// On Unix systems this will cause the SetDeadline methods to stop working.
 func (f *File) Fd() uintptr {
 	if f == nil {
 		return ^(uintptr(0))
@@ -65,7 +66,7 @@ func (f *File) Fd() uintptr {
 	// opened in blocking mode. The File will continue to work,
 	// but any blocking operation will tie up a thread.
 	if f.nonblock {
-		syscall.SetNonblock(f.pfd.Sysfd, false)
+		f.pfd.SetBlocking()
 	}
 
 	return uintptr(f.pfd.Sysfd)
@@ -152,12 +153,8 @@ func epipecheck(file *File, e error) {
 // On Unix-like systems, it is "/dev/null"; on Windows, "NUL".
 const DevNull = "/dev/null"
 
-// OpenFile is the generalized open call; most users will use Open
-// or Create instead. It opens the named file with specified flag
-// (O_RDONLY etc.) and perm, (0666 etc.) if applicable. If successful,
-// methods on the returned File can be used for I/O.
-// If there is an error, it will be of type *PathError.
-func OpenFile(name string, flag int, perm FileMode) (*File, error) {
+// openFileNolog is the Unix implementation of OpenFile.
+func openFileNolog(name string, flag int, perm FileMode) (*File, error) {
 	chmod := false
 	if !supportsCreateWithStickyBit && flag&O_CREATE != 0 && perm&ModeSticky != 0 {
 		if _, err := Stat(name); IsNotExist(err) {

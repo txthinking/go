@@ -41,6 +41,8 @@ import "strings"
 // The table's lower portion shows specialized features of each format,
 // such as supported string encodings, support for sub-second timestamps,
 // or support for sparse files.
+//
+// The Writer currently provides no support for sparse files.
 type Format int
 
 // Constants to identify various tar formats.
@@ -227,7 +229,7 @@ func (b *block) ComputeChecksum() (unsigned, signed int64) {
 		if 148 <= i && i < 156 {
 			c = ' ' // Treat the checksum field itself as all spaces.
 		}
-		unsigned += int64(uint8(c))
+		unsigned += int64(c)
 		signed += int64(int8(c))
 	}
 	return unsigned, signed
